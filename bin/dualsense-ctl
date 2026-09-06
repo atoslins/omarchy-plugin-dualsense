@@ -1155,7 +1155,7 @@ def cmd_info(args):
                 "v2" if fw["vibrationV2"] else "v1"))
 
 
-VERSION = "1.0.0"
+VERSION = "1.0.2"
 
 
 def build_parser():
