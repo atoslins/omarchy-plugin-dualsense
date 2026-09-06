@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "atoslins.dualsense",
+  "name": "DualSense",
+  "version": "1.0.0",
+  "author": "Atos Lins",
+  "description": "PlayStation DualSense battery, lightbar, player LEDs, adaptive triggers, audio, rumble and a live input tester in the bar",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "BarWidget.qml"
+  },
+  "barWidget": {
+    "displayName": "DualSense",
+    "description": "DualSense controller battery and full control panel",
+    "category": "Info",
+    "allowMultiple": false
+  }
+}

@@ -1,0 +1,1150 @@
+#!/usr/bin/env python3
+"""dualsense-ctl — inspect and control Sony DualSense / DualSense Edge
+controllers from Linux userspace with nothing but the standard library.
+
+It talks to the controller through the hidraw node the kernel already exposes
+(the same path dualsensectl uses), reads input through evdev, and reads battery
+and identity from sysfs. Works over USB and Bluetooth, alongside the kernel's
+hid_playstation driver.
+
+    dualsense-ctl status                      JSON snapshot of every controller
+    dualsense-ctl lightbar '#ff4000' --brightness 80
+    dualsense-ctl lightbar off | on
+    dualsense-ctl player 2 [--fade]           0-5 player LEDs (6 outer, 7 inner)
+    dualsense-ctl led-brightness high|medium|low
+    dualsense-ctl mic on|off                  mute / unmute the built-in mic
+    dualsense-ctl mic-led off|on|pulse
+    dualsense-ctl speaker headphone|internal|both|mono
+    dualsense-ctl volume 70                   headphone jack + speaker, 0-100
+    dualsense-ctl mic-volume 100
+    dualsense-ctl attenuation 0 0             rumble / trigger power reduction, 0-7
+    dualsense-ctl trigger both weapon --strength 6
+    dualsense-ctl rumble --strong 80 --weak 40 --ms 500
+    dualsense-ctl monitor [--rate 30]         live input as JSON lines
+    dualsense-ctl poweroff | disconnect       Bluetooth only
+    dualsense-ctl apply [--accent '#hex']     re-apply the saved profile
+    dualsense-ctl profile show|set KEY VALUE|reset
+
+Pick a controller with --device MAC (default: first found; --all for every one).
+"""
+
+import argparse
+import fcntl
+import glob
+import json
+import os
+import select
+import struct
+import subprocess
+import sys
+import time
+import zlib
+
+VENDOR = 0x054C
+MODELS = {0x0CE6: "DualSense", 0x0DF2: "DualSense Edge"}
+BUS_NAMES = {0x03: "usb", 0x05: "bluetooth"}
+
+DEFAULT_PROFILE_FILE = os.path.expanduser("~/.config/dualsense/profile.json")
+THEME_COLORS = os.path.expanduser("~/.local/state/omarchy/current/theme/colors.toml")
+
+# ---------------------------------------------------------------------------
+# Output report layout (47-byte "common" block shared by USB and Bluetooth)
+# ---------------------------------------------------------------------------
+COMMON_LEN = 47
+O_FLAG0, O_FLAG1 = 0, 1
+O_MOTOR_R, O_MOTOR_L = 2, 3
+O_HP_VOL, O_SPK_VOL, O_MIC_VOL, O_AUDIO, O_MUTE_LED, O_POWER_SAVE = 4, 5, 6, 7, 8, 9
+O_RT_MODE, O_RT_PARAM = 10, 11
+O_LT_MODE, O_LT_PARAM = 21, 22
+O_REDUCE_MOTOR = 36
+O_FLAG2 = 38
+O_LIGHTBAR_SETUP = 41
+O_LED_BRIGHTNESS = 42
+O_PLAYER_LEDS = 43
+O_LB_R, O_LB_G, O_LB_B = 44, 45, 46
+
+F0_COMPAT_VIBRATION = 0x01
+F0_HAPTICS_SELECT = 0x02
+F0_RIGHT_TRIGGER = 0x04
+F0_LEFT_TRIGGER = 0x08
+F0_HP_VOLUME = 0x10
+F0_SPK_VOLUME = 0x20
+F0_MIC_VOLUME = 0x40
+F0_AUDIO_CONTROL = 0x80
+
+F1_MIC_LED = 0x01
+F1_POWER_SAVE = 0x02
+F1_LIGHTBAR = 0x04
+F1_PLAYER_LEDS = 0x10
+F1_ATTENUATION = 0x40
+
+F2_LED_BRIGHTNESS = 0x01
+F2_LIGHTBAR_SETUP = 0x02
+F2_COMPAT_VIBRATION2 = 0x04
+
+POWER_SAVE_MIC_MUTE = 0x10
+LIGHTBAR_SETUP_ON = 0x01
+LIGHTBAR_SETUP_OFF = 0x02
+
+TRIGGER_MODES = {
+    "off": 0x05,
+    "feedback": 0x21,
+    "bow": 0x22,
+    "galloping": 0x23,
+    "weapon": 0x25,
+    "vibration": 0x26,
+    "machine": 0x27,
+}
+TRIGGER_EFFECTS = ["off", "feedback", "weapon", "bow", "galloping", "machine", "vibration"]
+PLAYER_PATTERNS = [0b00000, 0b00100, 0b01010, 0b10101, 0b11011, 0b11111, 0b10001, 0b01110]
+LED_BRIGHTNESS = {"high": 0, "medium": 1, "low": 2}
+SPEAKER_ROUTES = {"headphone": 0, "mono": 1, "both": 2, "internal": 3}
+MIC_LED_MODES = {"off": 0, "on": 1, "pulse": 2}
+
+CRC_OUTPUT_SEED = b"\xa2"
+CRC_FEATURE_SEED = b"\x53"
+
+DEFAULT_PROFILE = {
+    "lightbar": {"enabled": True, "color": "#1e64ff", "brightness": 70, "followTheme": False},
+    "player": {"leds": 1, "fade": False, "brightness": "high"},
+    "triggers": {
+        "left": {"effect": "off", "strength": 5},
+        "right": {"effect": "off", "strength": 5},
+    },
+    "audio": {"micMuted": False, "micLed": "auto", "speaker": None, "volume": None, "micVolume": None},
+    "motors": {"rumble": 0, "trigger": 0},
+}
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+def die(msg, code=1):
+    sys.stderr.write(msg.rstrip() + "\n")
+    sys.exit(code)
+
+
+def read_text(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def read_uevent(path):
+    out = {}
+    for line in read_text(path).splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            out[k] = v
+    return out
+
+
+def ioc(direction, typ, nr, size):
+    return (direction << 30) | (size << 16) | (ord(typ) << 8) | nr
+
+
+def hidiocgfeature(size):
+    return ioc(3, "H", 0x07, size)
+
+
+def hidiocsfeature(size):
+    return ioc(3, "H", 0x06, size)
+
+
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
+
+def parse_color(text):
+    """'#rrggbb', 'rrggbb', 'r,g,b' or a few names -> (r, g, b)."""
+    names = {
+        "blue": "#1e64ff", "red": "#ff2020", "green": "#20ff50", "purple": "#a020ff",
+        "pink": "#ff40b0", "orange": "#ff7a00", "yellow": "#ffd000", "cyan": "#00e0ff",
+        "white": "#ffffff", "off": "#000000", "black": "#000000",
+    }
+    t = str(text).strip().lower()
+    t = names.get(t, t)
+    if "," in t:
+        parts = [int(p) for p in t.split(",")]
+        if len(parts) != 3:
+            raise ValueError("expected r,g,b")
+        return tuple(clamp(p, 0, 255) for p in parts)
+    t = t.lstrip("#")
+    if len(t) == 3:
+        t = "".join(c * 2 for c in t)
+    if len(t) != 6:
+        raise ValueError("expected #rrggbb")
+    return tuple(int(t[i:i + 2], 16) for i in (0, 2, 4))
+
+
+def color_hex(rgb):
+    return "#%02x%02x%02x" % tuple(rgb)
+
+
+def theme_accent():
+    for line in read_text(THEME_COLORS).splitlines():
+        line = line.strip()
+        if line.startswith("accent") and "=" in line:
+            value = line.split("=", 1)[1].strip().strip('"').strip("'")
+            try:
+                return color_hex(parse_color(value))
+            except ValueError:
+                return None
+    return None
+
+
+# ---------------------------------------------------------------------------
+# profile
+# ---------------------------------------------------------------------------
+def merge(base, override):
+    out = json.loads(json.dumps(base))
+    for k, v in (override or {}).items():
+        if isinstance(v, dict) and isinstance(out.get(k), dict):
+            out[k] = merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def load_profile(path):
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            data = {}
+    except (OSError, ValueError):
+        data = {}
+    return merge(DEFAULT_PROFILE, data)
+
+
+def save_profile(path, profile):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(profile, f, indent=2, sort_keys=True)
+        f.write("\n")
+    os.replace(tmp, path)
+
+
+def profile_set(profile, key, raw):
+    """Set a dotted key ('lightbar.color') to a JSON-ish value, validating."""
+    parts = key.split(".")
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        value = raw
+    node = profile
+    for p in parts[:-1]:
+        if not isinstance(node.get(p), dict):
+            raise ValueError("unknown key: " + key)
+        node = node[p]
+    leaf = parts[-1]
+    if leaf not in node:
+        raise ValueError("unknown key: " + key)
+    # validate the common ones
+    if key == "lightbar.color":
+        value = color_hex(parse_color(value))
+    elif key == "lightbar.brightness":
+        value = clamp(int(value), 0, 100)
+    elif key in ("lightbar.enabled", "lightbar.followTheme", "player.fade", "audio.micMuted"):
+        value = bool(value) if not isinstance(value, str) else value.lower() in ("1", "true", "on", "yes")
+    elif key == "player.leds":
+        value = clamp(int(value), 0, len(PLAYER_PATTERNS) - 1)
+    elif key == "player.brightness":
+        if value not in LED_BRIGHTNESS:
+            raise ValueError("brightness must be high, medium or low")
+    elif key.endswith(".effect"):
+        if value not in TRIGGER_EFFECTS:
+            raise ValueError("effect must be one of " + ", ".join(TRIGGER_EFFECTS))
+    elif key.endswith(".strength"):
+        value = clamp(int(value), 1, 8)
+    elif key == "audio.micLed":
+        if value not in ("auto", "off", "on", "pulse"):
+            raise ValueError("micLed must be auto, off, on or pulse")
+    elif key == "audio.speaker":
+        if value is not None and value not in SPEAKER_ROUTES:
+            raise ValueError("speaker must be headphone, internal, both or mono")
+    elif key in ("audio.volume", "audio.micVolume"):
+        value = None if value is None or value == "" else clamp(int(value), 0, 100)
+    elif key in ("motors.rumble", "motors.trigger"):
+        value = clamp(int(value), 0, 7)
+    node[leaf] = value
+    return value
+
+
+# ---------------------------------------------------------------------------
+# discovery
+# ---------------------------------------------------------------------------
+def find_controllers():
+    found = []
+    for hr in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
+        dev = os.path.join(hr, "device")
+        ue = read_uevent(os.path.join(dev, "uevent"))
+        hid_id = ue.get("HID_ID", "")
+        try:
+            bus, vid, pid = [int(x, 16) for x in hid_id.split(":")]
+        except ValueError:
+            continue
+        if vid != VENDOR or pid not in MODELS:
+            continue
+        node = "/dev/" + os.path.basename(hr)
+        mac = ue.get("HID_UNIQ", "").lower()
+        gamepad = motion = touch = None
+        for inp in sorted(glob.glob(os.path.join(dev, "input", "input*"))):
+            events = sorted(glob.glob(os.path.join(inp, "event*")))
+            if not events:
+                continue
+            path = "/dev/input/" + os.path.basename(events[0])
+            name = read_text(os.path.join(inp, "name"))
+            if name.endswith("Motion Sensors"):
+                motion = path
+            elif name.endswith("Touchpad"):
+                touch = path
+            elif name.endswith("Headset Jack"):
+                pass
+            else:
+                gamepad = path
+        battery = {"capacity": None, "status": "unknown"}
+        for ps in glob.glob(os.path.join(dev, "power_supply", "*")):
+            cap = read_text(os.path.join(ps, "capacity"))
+            battery = {
+                "capacity": int(cap) if cap.isdigit() else None,
+                "status": read_text(os.path.join(ps, "status"), "unknown").lower(),
+            }
+        leds = {"lightbar": None, "player": []}
+        for led in sorted(glob.glob(os.path.join(dev, "leds", "*"))):
+            base = os.path.basename(led)
+            if base.endswith(":rgb:indicator"):
+                vals = read_text(os.path.join(led, "multi_intensity")).split()
+                if len(vals) == 3 and all(v.isdigit() for v in vals):
+                    leds["lightbar"] = [int(v) for v in vals]
+            elif ":player-" in base:
+                leds["player"].append(read_text(os.path.join(led, "brightness")) == "1")
+        found.append({
+            "id": mac or node,
+            "mac": mac,
+            "model": MODELS[pid],
+            "productId": pid,
+            "bus": BUS_NAMES.get(bus, "unknown"),
+            "node": node,
+            "event": gamepad,
+            "motion": motion,
+            "touchpad": touch,
+            "battery": battery,
+            "hardwareVersion": read_text(os.path.join(dev, "hardware_version")),
+            "firmwareVersion": read_text(os.path.join(dev, "firmware_version")),
+            "driver": os.path.basename(os.path.realpath(os.path.join(dev, "driver"))) if os.path.exists(os.path.join(dev, "driver")) else "",
+            "leds": leds,
+            "access": {
+                "hidraw": os.access(node, os.R_OK | os.W_OK),
+                "event": bool(gamepad) and os.access(gamepad, os.R_OK | os.W_OK),
+                "motion": bool(motion) and os.access(motion, os.R_OK),
+                "touchpad": bool(touch) and os.access(touch, os.R_OK),
+            },
+        })
+    # USB first, then by MAC — a stable order for "first controller"
+    found.sort(key=lambda c: (c["bus"] != "usb", c["mac"]))
+    return found
+
+
+def select_controllers(args, need_hidraw=True):
+    all_found = find_controllers()
+    if not all_found:
+        die("No DualSense controller connected", 3)
+    if getattr(args, "all", False):
+        chosen = all_found
+    elif getattr(args, "device", None):
+        want = args.device.lower()
+        chosen = [c for c in all_found if c["mac"] == want or c["node"] == want or c["id"] == want]
+        if not chosen:
+            die("No controller matches " + args.device, 3)
+    else:
+        chosen = all_found[:1]
+    if need_hidraw:
+        for c in chosen:
+            if not c["access"]["hidraw"]:
+                die("No read/write access to %s. Install the udev rule from the plugin's udev/ directory "
+                    "(or the steam-devices package) and reconnect the controller." % c["node"], 4)
+    return chosen
+
+
+# ---------------------------------------------------------------------------
+# the controller
+# ---------------------------------------------------------------------------
+class Controller:
+    def __init__(self, info):
+        self.info = info
+        self.bt = info["bus"] == "bluetooth"
+        self.fd = None
+        self.seq = int(time.time() * 1000) & 0x0F
+
+    def __enter__(self):
+        self.fd = os.open(self.info["node"], os.O_RDWR | os.O_NONBLOCK)
+        return self
+
+    def __exit__(self, *exc):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+    def new_common(self):
+        return bytearray(COMMON_LEN)
+
+    def send(self, common):
+        if self.bt:
+            report = bytearray(78)
+            report[0] = 0x31
+            report[1] = (self.seq << 4) & 0xF0
+            self.seq = (self.seq + 1) & 0x0F
+            report[2] = 0x10
+            report[3:3 + COMMON_LEN] = common
+            crc = zlib.crc32(CRC_OUTPUT_SEED + bytes(report[:74])) & 0xFFFFFFFF
+            report[74:78] = struct.pack("<I", crc)
+        else:
+            report = bytearray(63)
+            report[0] = 0x02
+            report[1:1 + COMMON_LEN] = common
+        written = os.write(self.fd, bytes(report))
+        if written != len(report):
+            raise OSError("short write to " + self.info["node"])
+
+    def get_feature(self, report_id, size):
+        buf = bytearray(size)
+        buf[0] = report_id
+        fcntl.ioctl(self.fd, hidiocgfeature(size), buf, True)
+        return bytes(buf)
+
+    def set_feature(self, data):
+        buf = bytearray(data)
+        fcntl.ioctl(self.fd, hidiocsfeature(len(buf)), buf, True)
+
+    # ----- firmware -----
+    def firmware(self):
+        try:
+            b = self.get_feature(0x20, 64)
+        except OSError:
+            return None
+        fw_type, sw_series = struct.unpack_from("<HH", b, 20)
+        hw_info, fw_version = struct.unpack_from("<II", b, 24)
+        update_version = struct.unpack_from("<H", b, 44)[0]
+        return {
+            "buildDate": b[1:12].decode("ascii", "replace").strip("\x00 "),
+            "buildTime": b[12:20].decode("ascii", "replace").strip("\x00 "),
+            "version": "%d.%d.%d" % ((fw_version >> 24) & 0xFF, (fw_version >> 16) & 0xFF, fw_version & 0xFFFF),
+            "updateVersion": "%04x" % update_version,
+            "hardwareInfo": "%08x" % hw_info,
+            "type": fw_type,
+            "series": sw_series,
+            "vibrationV2": update_version >= 0x0221,
+        }
+
+    # ----- feature builders (each returns the common block it filled) -----
+    def fill_lightbar(self, common, rgb, brightness=100):
+        scale = clamp(int(brightness), 0, 100) / 100.0
+        common[O_FLAG1] |= F1_LIGHTBAR
+        common[O_LB_R] = int(round(rgb[0] * scale))
+        common[O_LB_G] = int(round(rgb[1] * scale))
+        common[O_LB_B] = int(round(rgb[2] * scale))
+
+    def fill_lightbar_setup(self, common, on):
+        common[O_FLAG2] |= F2_LIGHTBAR_SETUP
+        common[O_LIGHTBAR_SETUP] = LIGHTBAR_SETUP_ON if on else LIGHTBAR_SETUP_OFF
+
+    def fill_player(self, common, number, fade=False):
+        common[O_FLAG1] |= F1_PLAYER_LEDS
+        common[O_PLAYER_LEDS] = PLAYER_PATTERNS[clamp(int(number), 0, len(PLAYER_PATTERNS) - 1)] | (0 if fade else 0x20)
+
+    def fill_led_brightness(self, common, level):
+        common[O_FLAG2] |= F2_LED_BRIGHTNESS
+        common[O_LED_BRIGHTNESS] = LED_BRIGHTNESS[level]
+
+    def fill_mic(self, common, muted):
+        common[O_FLAG1] |= F1_POWER_SAVE
+        if muted:
+            common[O_POWER_SAVE] |= POWER_SAVE_MIC_MUTE
+        else:
+            common[O_POWER_SAVE] &= ~POWER_SAVE_MIC_MUTE & 0xFF
+
+    def fill_mic_led(self, common, mode):
+        common[O_FLAG1] |= F1_MIC_LED
+        common[O_MUTE_LED] = MIC_LED_MODES[mode]
+
+    def fill_speaker(self, common, route):
+        common[O_FLAG0] |= F0_AUDIO_CONTROL
+        common[O_AUDIO] = (common[O_AUDIO] & 0x0F) | (SPEAKER_ROUTES[route] << 4)
+
+    def fill_volume(self, common, percent):
+        v = clamp(int(percent), 0, 100)
+        common[O_FLAG0] |= F0_HP_VOLUME | F0_SPK_VOLUME
+        common[O_HP_VOL] = v * 0x7F // 100
+        common[O_SPK_VOL] = v * 0x64 // 100
+
+    def fill_mic_volume(self, common, percent):
+        common[O_FLAG0] |= F0_MIC_VOLUME
+        common[O_MIC_VOL] = clamp(int(percent), 0, 100) * 0x40 // 100
+
+    def fill_attenuation(self, common, rumble, trigger):
+        common[O_FLAG1] |= F1_ATTENUATION
+        common[O_REDUCE_MOTOR] = (clamp(int(rumble), 0, 7) & 0x07) | ((clamp(int(trigger), 0, 7) & 0x07) << 4)
+
+    def fill_rumble(self, common, strong, weak, vibration_v2):
+        common[O_FLAG0] |= F0_HAPTICS_SELECT
+        if vibration_v2:
+            common[O_FLAG2] |= F2_COMPAT_VIBRATION2
+        else:
+            common[O_FLAG0] |= F0_COMPAT_VIBRATION
+        common[O_MOTOR_L] = clamp(int(strong), 0, 100) * 255 // 100
+        common[O_MOTOR_R] = clamp(int(weak), 0, 100) * 255 // 100
+
+    def fill_trigger(self, common, side, mode, params):
+        params = list(params) + [0] * (10 - len(params))
+        if side in ("right", "both"):
+            common[O_FLAG0] |= F0_RIGHT_TRIGGER
+            common[O_RT_MODE] = mode
+            common[O_RT_PARAM:O_RT_PARAM + 10] = bytes(params[:10])
+        if side in ("left", "both"):
+            common[O_FLAG0] |= F0_LEFT_TRIGGER
+            common[O_LT_MODE] = mode
+            common[O_LT_PARAM:O_LT_PARAM + 10] = bytes(params[:10])
+
+    # ----- evdev rumble (the same path games use) -----
+    def rumble_evdev(self, strong, weak, ms):
+        path = self.info.get("event")
+        if not path or not os.access(path, os.R_OK | os.W_OK):
+            raise OSError("no writable evdev node")
+        fd = os.open(path, os.O_RDWR)
+        try:
+            FF_RUMBLE, EV_FF = 0x50, 0x15
+            effect = bytearray(48)
+            struct.pack_into("<HhHHHHH", effect, 0, FF_RUMBLE, -1, 0, 0, 0, clamp(int(ms), 0, 32767), 0)
+            struct.pack_into("<HH", effect, 16,
+                             clamp(int(strong), 0, 100) * 0xFFFF // 100,
+                             clamp(int(weak), 0, 100) * 0xFFFF // 100)
+            fcntl.ioctl(fd, ioc(1, "E", 0x80, 48), effect, True)
+            effect_id = struct.unpack_from("<h", effect, 2)[0]
+            os.write(fd, struct.pack("<qqHHi", 0, 0, EV_FF, effect_id, 1))
+            time.sleep(ms / 1000.0 + 0.05)
+            os.write(fd, struct.pack("<qqHHi", 0, 0, EV_FF, effect_id, 0))
+            fcntl.ioctl(fd, ioc(1, "E", 0x81, 4), effect_id)
+        finally:
+            os.close(fd)
+
+    def power_off(self):
+        buf = bytearray(47)
+        buf[0] = 0x08
+        buf[1] = 0x02
+        if self.bt:
+            crc = zlib.crc32(CRC_FEATURE_SEED + bytes(buf[:43])) & 0xFFFFFFFF
+            buf[43:47] = struct.pack("<I", crc)
+        self.set_feature(buf)
+
+
+# ---------------------------------------------------------------------------
+# trigger effects (parameter packing follows dualsensectl / DualSense docs)
+# ---------------------------------------------------------------------------
+def pack_zones(strengths, frequency=0):
+    """10 zones of strength 0-8 -> the 9 parameter bytes of feedback/vibration modes."""
+    strength_zones = 0
+    active = 0
+    for i, s in enumerate(strengths[:10]):
+        s = clamp(int(s), 0, 8)
+        if s > 0:
+            strength_zones |= ((s - 1) & 0x07) << (3 * i)
+            active |= 1 << i
+    return [active & 0xFF, (active >> 8) & 0xFF,
+            strength_zones & 0xFF, (strength_zones >> 8) & 0xFF,
+            (strength_zones >> 16) & 0xFF, (strength_zones >> 24) & 0xFF,
+            0, 0, clamp(int(frequency), 0, 255)]
+
+
+def trigger_params(effect, strength=5, start=None, end=None, frequency=None):
+    """Sensible presets for each effect, scaled by a 1-8 strength."""
+    s = clamp(int(strength), 1, 8)
+    if effect == "off":
+        return TRIGGER_MODES["off"], []
+    if effect == "feedback":
+        pos = 2 if start is None else clamp(int(start), 0, 9)
+        return TRIGGER_MODES["feedback"], pack_zones([0] * pos + [s] * (10 - pos))
+    if effect == "weapon":
+        a = 2 if start is None else clamp(int(start), 2, 7)
+        b = 6 if end is None else clamp(int(end), a + 1, 8)
+        zones = (1 << a) | (1 << b)
+        return TRIGGER_MODES["weapon"], [zones & 0xFF, (zones >> 8) & 0xFF, s - 1]
+    if effect == "bow":
+        a = 1 if start is None else clamp(int(start), 1, 7)
+        b = 6 if end is None else clamp(int(end), a + 1, 8)
+        zones = (1 << a) | (1 << b)
+        snap = clamp(s, 1, 8)
+        pair = ((s - 1) & 0x07) | (((snap - 1) & 0x07) << 3)
+        return TRIGGER_MODES["bow"], [zones & 0xFF, (zones >> 8) & 0xFF, pair & 0xFF]
+    if effect == "galloping":
+        a = 2 if start is None else clamp(int(start), 0, 8)
+        b = 8 if end is None else clamp(int(end), a + 1, 9)
+        zones = (1 << a) | (1 << b)
+        first, second = 2, 5
+        freq = clamp(s // 2 + 1, 1, 8) if frequency is None else clamp(int(frequency), 1, 255)
+        ratio = (second & 0x07) | ((first & 0x07) << 3)
+        return TRIGGER_MODES["galloping"], [zones & 0xFF, (zones >> 8) & 0xFF, ratio & 0xFF, freq]
+    if effect == "machine":
+        a = 1 if start is None else clamp(int(start), 1, 8)
+        b = 8 if end is None else clamp(int(end), a + 1, 9)
+        zones = (1 << a) | (1 << b)
+        sa = clamp(s - 1, 0, 7)
+        sb = clamp(s, 0, 7)
+        freq = 8 if frequency is None else clamp(int(frequency), 1, 255)
+        pair = (sa & 0x07) | ((sb & 0x07) << 3)
+        return TRIGGER_MODES["machine"], [zones & 0xFF, (zones >> 8) & 0xFF, pair & 0xFF, freq, 3]
+    if effect == "vibration":
+        pos = 2 if start is None else clamp(int(start), 0, 9)
+        freq = 10 if frequency is None else clamp(int(frequency), 1, 255)
+        return TRIGGER_MODES["vibration"], pack_zones([0] * pos + [s] * (10 - pos), freq)
+    raise ValueError("unknown trigger effect: " + str(effect))
+
+
+# ---------------------------------------------------------------------------
+# apply a profile
+# ---------------------------------------------------------------------------
+def build_profile_report(ctl, profile, accent=None, firmware=None):
+    common = ctl.new_common()
+    lb = profile["lightbar"]
+    color = lb["color"]
+    if lb.get("followTheme") and accent:
+        color = accent
+    # LIGHT_ON makes the firmware run its own "power on" lightbar routine
+    # (which ends in default blue) and ignores the RGB in the same report, so
+    # never send it: on = the color itself, off = black plus a fade out.
+    if lb.get("enabled", True):
+        ctl.fill_lightbar(common, parse_color(color), lb.get("brightness", 100))
+    else:
+        ctl.fill_lightbar(common, (0, 0, 0), 100)
+        ctl.fill_lightbar_setup(common, False)
+    pl = profile["player"]
+    ctl.fill_player(common, pl.get("leds", 1), bool(pl.get("fade", False)))
+    if pl.get("brightness") in LED_BRIGHTNESS:
+        ctl.fill_led_brightness(common, pl["brightness"])
+    au = profile["audio"]
+    ctl.fill_mic(common, bool(au.get("micMuted", False)))
+    led = au.get("micLed", "auto")
+    if led == "auto":
+        led = "on" if au.get("micMuted") else "off"
+    if led in MIC_LED_MODES:
+        ctl.fill_mic_led(common, led)
+    if au.get("speaker") in SPEAKER_ROUTES:
+        ctl.fill_speaker(common, au["speaker"])
+    if au.get("volume") is not None:
+        ctl.fill_volume(common, au["volume"])
+    if au.get("micVolume") is not None:
+        ctl.fill_mic_volume(common, au["micVolume"])
+    mo = profile["motors"]
+    ctl.fill_attenuation(common, mo.get("rumble", 0), mo.get("trigger", 0))
+    for side in ("left", "right"):
+        t = profile["triggers"][side]
+        mode, params = trigger_params(t.get("effect", "off"), t.get("strength", 5))
+        ctl.fill_trigger(common, side, mode, params)
+    return common
+
+
+# ---------------------------------------------------------------------------
+# evdev monitor
+# ---------------------------------------------------------------------------
+EV_KEY, EV_ABS = 1, 3
+BTN_NAMES = {
+    304: "cross", 305: "circle", 307: "triangle", 308: "square",
+    310: "l1", 311: "r1", 312: "l2", 313: "r2",
+    314: "create", 315: "options", 316: "ps", 317: "l3", 318: "r3",
+}
+GAMEPAD_AXES = {0: "lx", 1: "ly", 2: "l2", 3: "rx", 4: "ry", 5: "r2", 16: "dx", 17: "dy"}
+MOTION_AXES = {0: "ax", 1: "ay", 2: "az", 3: "gx", 4: "gy", 5: "gz"}
+ABS_MT_SLOT, ABS_MT_POSITION_X, ABS_MT_POSITION_Y, ABS_MT_TRACKING_ID = 0x2F, 0x35, 0x36, 0x39
+BTN_LEFT, BTN_TOUCH = 0x110, 0x14A
+EVENT_FMT = "qqHHi"
+EVENT_SIZE = struct.calcsize(EVENT_FMT)
+
+
+def absinfo(fd, code):
+    buf = bytearray(24)
+    try:
+        fcntl.ioctl(fd, ioc(2, "E", 0x40 + code, 24), buf, True)
+    except OSError:
+        return None
+    value, lo, hi, fuzz, flat, res = struct.unpack("<iiiiii", buf)
+    return {"value": value, "min": lo, "max": hi, "res": res}
+
+
+def monitor(info, rate):
+    devices = {}
+    for key in ("event", "motion", "touchpad"):
+        path = info.get(key)
+        if path and os.access(path, os.R_OK):
+            try:
+                devices[os.open(path, os.O_RDONLY | os.O_NONBLOCK)] = key
+            except OSError:
+                pass
+    if not devices:
+        die("No readable input device for " + info["id"], 4)
+
+    state = {
+        "buttons": {name: False for name in BTN_NAMES.values()},
+        "touchClick": False,
+        "lx": 0.0, "ly": 0.0, "rx": 0.0, "ry": 0.0, "l2": 0.0, "r2": 0.0, "dx": 0, "dy": 0,
+        "accel": [0.0, 0.0, 0.0], "gyro": [0.0, 0.0, 0.0],
+        "touches": [],
+        "battery": info["battery"],
+        "sources": {key: True for key in devices.values()},
+    }
+    ranges = {}
+    for fd, key in devices.items():
+        codes = GAMEPAD_AXES if key == "event" else MOTION_AXES if key == "motion" else {}
+        for code in codes:
+            ranges[(key, code)] = absinfo(fd, code)
+    touch_range = None
+    for fd, key in devices.items():
+        if key == "touchpad":
+            touch_range = (absinfo(fd, ABS_MT_POSITION_X), absinfo(fd, ABS_MT_POSITION_Y))
+    slots = {}
+    current_slot = 0
+
+    def norm(key, code, value, signed):
+        r = ranges.get((key, code))
+        if not r or r["max"] == r["min"]:
+            return float(value)
+        if signed:
+            mid = (r["max"] + r["min"]) / 2.0
+            return clamp((value - mid) / ((r["max"] - r["min"]) / 2.0), -1.0, 1.0)
+        return clamp((value - r["min"]) / float(r["max"] - r["min"]), 0.0, 1.0)
+
+    def battery():
+        for ps in glob.glob("/sys/class/power_supply/ps-controller-battery-*"):
+            if info["mac"] and info["mac"] in os.path.basename(ps).lower():
+                cap = read_text(os.path.join(ps, "capacity"))
+                return {"capacity": int(cap) if cap.isdigit() else None,
+                        "status": read_text(os.path.join(ps, "status"), "unknown").lower()}
+        return state["battery"]
+
+    interval = 1.0 / max(1, rate)
+    last_emit = 0.0
+    last_battery = 0.0
+    dirty = True
+    out = sys.stdout
+    try:
+        while True:
+            now = time.monotonic()
+            if now - last_battery > 2.0:
+                state["battery"] = battery()
+                last_battery = now
+                dirty = True
+            if dirty and now - last_emit >= interval:
+                state["touches"] = [{"x": t["x"], "y": t["y"]} for t in slots.values() if t.get("id", -1) >= 0]
+                out.write(json.dumps(state, separators=(",", ":")) + "\n")
+                out.flush()
+                last_emit = now
+                dirty = False
+            timeout = interval if dirty else 0.5
+            ready, _, _ = select.select(list(devices.keys()), [], [], timeout)
+            for fd in ready:
+                key = devices[fd]
+                try:
+                    data = os.read(fd, EVENT_SIZE * 64)
+                except BlockingIOError:
+                    continue
+                except OSError:
+                    return  # device went away
+                for off in range(0, len(data) - EVENT_SIZE + 1, EVENT_SIZE):
+                    _, _, etype, code, value = struct.unpack_from(EVENT_FMT, data, off)
+                    if key == "event":
+                        if etype == EV_KEY and code in BTN_NAMES:
+                            state["buttons"][BTN_NAMES[code]] = value != 0
+                            dirty = True
+                        elif etype == EV_ABS and code in GAMEPAD_AXES:
+                            name = GAMEPAD_AXES[code]
+                            if name in ("dx", "dy"):
+                                state[name] = int(value)
+                            elif name in ("l2", "r2"):
+                                state[name] = round(norm(key, code, value, False), 3)
+                            else:
+                                state[name] = round(norm(key, code, value, True), 3)
+                            dirty = True
+                    elif key == "motion":
+                        if etype == EV_ABS and code in MOTION_AXES:
+                            name = MOTION_AXES[code]
+                            r = ranges.get((key, code))
+                            # accel in g, gyro in deg/s when the driver reports resolution
+                            if r and r["res"]:
+                                val = value / float(r["res"])
+                            else:
+                                val = norm(key, code, value, True)
+                            target = state["accel"] if name.startswith("a") else state["gyro"]
+                            target["xyz".index(name[1])] = round(val, 2)
+                            dirty = True
+                    elif key == "touchpad":
+                        if etype == EV_KEY and code == BTN_LEFT:
+                            state["touchClick"] = value != 0
+                            dirty = True
+                        elif etype == EV_ABS:
+                            if code == ABS_MT_SLOT:
+                                current_slot = value
+                            elif code == ABS_MT_TRACKING_ID:
+                                slots.setdefault(current_slot, {"x": 0.0, "y": 0.0})["id"] = value
+                                dirty = True
+                            elif code in (ABS_MT_POSITION_X, ABS_MT_POSITION_Y) and touch_range:
+                                r = touch_range[0] if code == ABS_MT_POSITION_X else touch_range[1]
+                                v = value / float(r["max"]) if r and r["max"] else 0.0
+                                slots.setdefault(current_slot, {"x": 0.0, "y": 0.0, "id": -1})["x" if code == ABS_MT_POSITION_X else "y"] = round(clamp(v, 0.0, 1.0), 3)
+                                dirty = True
+    except (KeyboardInterrupt, BrokenPipeError):
+        # a closed pipe (head, the shell shutting down) is a normal way to stop
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        except OSError:
+            pass
+        return
+    finally:
+        for fd in devices:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# commands
+# ---------------------------------------------------------------------------
+def cmd_status(args):
+    controllers = find_controllers()
+    for c in controllers:
+        c["firmware"] = None
+        if c["access"]["hidraw"]:
+            try:
+                with Controller(c) as ctl:
+                    c["firmware"] = ctl.firmware()
+            except OSError:
+                pass
+    profile_file = args.profile
+    payload = {
+        "controllers": controllers,
+        "profile": load_profile(profile_file),
+        "profileFile": profile_file,
+        "accent": theme_accent(),
+        "tools": {"bluetoothctl": bool(which("bluetoothctl"))},
+        "version": VERSION,
+    }
+    if args.json or not sys.stdout.isatty():
+        print(json.dumps(payload, separators=(",", ":") if not args.pretty else None, indent=2 if args.pretty else None))
+        return
+    if not controllers:
+        print("No DualSense controller connected")
+        return
+    for c in controllers:
+        b = c["battery"]
+        fw = c.get("firmware") or {}
+        print("%s  %s  %s" % (c["model"], c["mac"] or "", c["bus"]))
+        print("  battery: %s%% %s" % (b["capacity"] if b["capacity"] is not None else "?", b["status"]))
+        print("  hidraw: %s (%s)  evdev: %s" % (c["node"], "ok" if c["access"]["hidraw"] else "NO ACCESS", c["event"] or "-"))
+        if fw:
+            print("  firmware: %s  update %s  built %s %s" % (fw["version"], fw["updateVersion"], fw["buildDate"], fw["buildTime"]))
+
+
+def which(name):
+    for d in os.environ.get("PATH", "").split(os.pathsep):
+        p = os.path.join(d, name)
+        if os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def send_to_each(args, fill, need_firmware=False):
+    for info in select_controllers(args):
+        with Controller(info) as ctl:
+            common = ctl.new_common()
+            fw = ctl.firmware() if need_firmware else None
+            fill(ctl, common, fw)
+            ctl.send(common)
+
+
+def cmd_lightbar(args):
+    text = args.color.strip().lower()
+    if text == "off":
+        def off(ctl, c, fw):
+            ctl.fill_lightbar(c, (0, 0, 0), 100)
+            ctl.fill_lightbar_setup(c, False)
+        send_to_each(args, off)
+        return
+    if text == "on":
+        lb = load_profile(args.profile)["lightbar"]
+        rgb = parse_color(theme_accent() if lb.get("followTheme") and theme_accent() else lb["color"])
+        send_to_each(args, lambda ctl, c, fw: ctl.fill_lightbar(c, rgb, lb.get("brightness", 100)))
+        return
+    rgb = parse_color(text)
+    send_to_each(args, lambda ctl, c, fw: ctl.fill_lightbar(c, rgb, args.brightness))
+
+
+def cmd_player(args):
+    send_to_each(args, lambda ctl, c, fw: ctl.fill_player(c, args.number, args.fade))
+
+
+def cmd_led_brightness(args):
+    send_to_each(args, lambda ctl, c, fw: ctl.fill_led_brightness(c, args.level))
+
+
+def cmd_mic(args):
+    muted = args.state == "off"
+
+    def fill(ctl, c, fw):
+        ctl.fill_mic(c, muted)
+        if args.led:
+            ctl.fill_mic_led(c, "on" if muted else "off")
+    send_to_each(args, fill)
+
+
+def cmd_mic_led(args):
+    send_to_each(args, lambda ctl, c, fw: ctl.fill_mic_led(c, args.mode))
+
+
+def cmd_speaker(args):
+    send_to_each(args, lambda ctl, c, fw: ctl.fill_speaker(c, args.route))
+
+
+def cmd_volume(args):
+    send_to_each(args, lambda ctl, c, fw: ctl.fill_volume(c, args.percent))
+
+
+def cmd_mic_volume(args):
+    send_to_each(args, lambda ctl, c, fw: ctl.fill_mic_volume(c, args.percent))
+
+
+def cmd_attenuation(args):
+    send_to_each(args, lambda ctl, c, fw: ctl.fill_attenuation(c, args.rumble, args.trigger))
+
+
+def cmd_trigger(args):
+    mode, params = trigger_params(args.effect, args.strength, args.start, args.end, args.frequency)
+    send_to_each(args, lambda ctl, c, fw: ctl.fill_trigger(c, args.side, mode, params))
+
+
+def cmd_rumble(args):
+    for info in select_controllers(args, need_hidraw=False):
+        with Controller(info) as ctl:
+            if not args.raw and info["access"]["event"]:
+                try:
+                    ctl.rumble_evdev(args.strong, args.weak, args.ms)
+                    continue
+                except OSError:
+                    pass
+            if not info["access"]["hidraw"]:
+                die("No access to %s or %s" % (info["node"], info.get("event")), 4)
+            fw = ctl.firmware() or {}
+            common = ctl.new_common()
+            ctl.fill_rumble(common, args.strong, args.weak, fw.get("vibrationV2", True))
+            ctl.send(common)
+            time.sleep(args.ms / 1000.0)
+            common = ctl.new_common()
+            ctl.fill_rumble(common, 0, 0, fw.get("vibrationV2", True))
+            ctl.send(common)
+
+
+def cmd_poweroff(args):
+    for info in select_controllers(args):
+        if info["bus"] != "bluetooth":
+            die("%s is on USB — unplug it to power off (poweroff only works over Bluetooth)" % info["model"], 5)
+        with Controller(info) as ctl:
+            try:
+                ctl.power_off()
+                continue
+            except OSError:
+                pass
+        if which("bluetoothctl") and info["mac"]:
+            subprocess.run(["bluetoothctl", "disconnect", info["mac"].upper()], check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            die("Could not power off " + info["id"], 2)
+
+
+def cmd_disconnect(args):
+    for info in select_controllers(args, need_hidraw=False):
+        if info["bus"] != "bluetooth":
+            die("%s is on USB — unplug the cable to disconnect" % info["model"], 5)
+        if not which("bluetoothctl"):
+            die("bluetoothctl not found", 2)
+        subprocess.run(["bluetoothctl", "disconnect", info["mac"].upper()], check=False,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def cmd_apply(args):
+    profile = load_profile(args.profile)
+    accent = args.accent or theme_accent()
+    for info in select_controllers(args):
+        with Controller(info) as ctl:
+            ctl.send(build_profile_report(ctl, profile, accent))
+
+
+def cmd_profile(args):
+    profile = load_profile(args.profile)
+    if args.action == "show":
+        print(json.dumps(profile, indent=2, sort_keys=True))
+        return
+    if args.action == "reset":
+        profile = json.loads(json.dumps(DEFAULT_PROFILE))
+    elif args.action == "set":
+        if not args.key or args.value is None:
+            die("usage: profile set KEY VALUE", 2)
+        profile_set(profile, args.key, args.value)
+    elif args.action == "path":
+        print(args.profile)
+        return
+    save_profile(args.profile, profile)
+    if not args.no_apply and find_controllers():
+        accent = args.accent or theme_accent()
+        try:
+            for info in select_controllers(args):
+                with Controller(info) as ctl:
+                    ctl.send(build_profile_report(ctl, profile, accent))
+        except SystemExit:
+            pass
+    print(json.dumps(profile, separators=(",", ":")))
+
+
+def cmd_monitor(args):
+    info = select_controllers(args, need_hidraw=False)[0]
+    monitor(info, args.rate)
+
+
+def cmd_info(args):
+    for info in select_controllers(args, need_hidraw=False):
+        fw = None
+        if info["access"]["hidraw"]:
+            with Controller(info) as ctl:
+                fw = ctl.firmware()
+        print("%s (%s)" % (info["model"], info["bus"]))
+        print("  MAC:        %s" % (info["mac"] or "?"))
+        print("  hidraw:     %s%s" % (info["node"], "" if info["access"]["hidraw"] else "  (no access)"))
+        print("  evdev:      %s" % (info["event"] or "-"))
+        print("  motion:     %s" % (info["motion"] or "-"))
+        print("  touchpad:   %s" % (info["touchpad"] or "-"))
+        print("  battery:    %s%% %s" % (info["battery"]["capacity"], info["battery"]["status"]))
+        print("  hw version: %s" % info["hardwareVersion"])
+        print("  fw version: %s" % info["firmwareVersion"])
+        if fw:
+            print("  firmware:   %s  update %s  built %s %s  (%s vibration)" % (
+                fw["version"], fw["updateVersion"], fw["buildDate"], fw["buildTime"],
+                "v2" if fw["vibrationV2"] else "v1"))
+
+
+VERSION = "1.0.0"
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="dualsense-ctl", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--device", "-d", help="controller MAC (or hidraw node) to talk to")
+    p.add_argument("--all", action="store_true", help="apply to every connected controller")
+    p.add_argument("--profile", default=os.environ.get("DUALSENSE_PROFILE", DEFAULT_PROFILE_FILE),
+                   help="profile file (default %s)" % DEFAULT_PROFILE_FILE)
+    p.add_argument("--version", action="version", version="dualsense-ctl " + VERSION)
+    sub = p.add_subparsers(dest="command", required=True)
+
+    s = sub.add_parser("status", help="JSON snapshot of connected controllers")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--pretty", action="store_true")
+    s.set_defaults(func=cmd_status)
+
+    s = sub.add_parser("info", help="human readable controller details")
+    s.set_defaults(func=cmd_info)
+
+    s = sub.add_parser("lightbar", help="set lightbar color, or 'off' / 'on'")
+    s.add_argument("color")
+    s.add_argument("--brightness", "-b", type=int, default=100, help="0-100")
+    s.set_defaults(func=cmd_lightbar)
+
+    s = sub.add_parser("player", help="player indicator LEDs: 0 (off) to 5, 6 outer pair, 7 inner three")
+    s.add_argument("number", type=int)
+    s.add_argument("--fade", action="store_true", help="fade in instead of switching instantly")
+    s.set_defaults(func=cmd_player)
+
+    s = sub.add_parser("led-brightness", help="player LED brightness")
+    s.add_argument("level", choices=sorted(LED_BRIGHTNESS, key=LED_BRIGHTNESS.get))
+    s.set_defaults(func=cmd_led_brightness)
+
+    s = sub.add_parser("mic", help="built-in microphone on (unmuted) / off (muted)")
+    s.add_argument("state", choices=["on", "off"])
+    s.add_argument("--led", action="store_true", help="also light the mute LED while muted")
+    s.set_defaults(func=cmd_mic)
+
+    s = sub.add_parser("mic-led", help="mute button LED")
+    s.add_argument("mode", choices=list(MIC_LED_MODES))
+    s.set_defaults(func=cmd_mic_led)
+
+    s = sub.add_parser("speaker", help="audio output routing")
+    s.add_argument("route", choices=list(SPEAKER_ROUTES))
+    s.set_defaults(func=cmd_speaker)
+
+    s = sub.add_parser("volume", help="headphone jack and speaker volume, 0-100")
+    s.add_argument("percent", type=int)
+    s.set_defaults(func=cmd_volume)
+
+    s = sub.add_parser("mic-volume", help="built-in microphone gain, 0-100")
+    s.add_argument("percent", type=int)
+    s.set_defaults(func=cmd_mic_volume)
+
+    s = sub.add_parser("attenuation", help="reduce rumble / trigger motor power (0 = full, 7 = weakest)")
+    s.add_argument("rumble", type=int)
+    s.add_argument("trigger", type=int)
+    s.set_defaults(func=cmd_attenuation)
+
+    s = sub.add_parser("trigger", help="adaptive trigger effect")
+    s.add_argument("side", choices=["left", "right", "both"])
+    s.add_argument("effect", choices=TRIGGER_EFFECTS)
+    s.add_argument("--strength", "-s", type=int, default=5, help="1-8")
+    s.add_argument("--start", type=int, help="start zone (effect specific)")
+    s.add_argument("--end", type=int, help="end zone (effect specific)")
+    s.add_argument("--frequency", "-f", type=int, help="Hz for galloping / machine / vibration")
+    s.set_defaults(func=cmd_trigger)
+
+    s = sub.add_parser("rumble", help="test the rumble motors")
+    s.add_argument("--strong", type=int, default=80, help="left/heavy motor, 0-100")
+    s.add_argument("--weak", type=int, default=40, help="right/light motor, 0-100")
+    s.add_argument("--ms", type=int, default=400)
+    s.add_argument("--raw", action="store_true", help="drive the motors over hidraw instead of evdev force feedback")
+    s.set_defaults(func=cmd_rumble)
+
+    s = sub.add_parser("poweroff", help="turn the controller off (Bluetooth only)")
+    s.set_defaults(func=cmd_poweroff)
+
+    s = sub.add_parser("disconnect", help="drop the Bluetooth link (bluetoothctl)")
+    s.set_defaults(func=cmd_disconnect)
+
+    s = sub.add_parser("apply", help="apply the saved profile")
+    s.add_argument("--accent", help="theme accent color for lightbar.followTheme")
+    s.set_defaults(func=cmd_apply)
+
+    s = sub.add_parser("profile", help="show / set / reset the saved profile (and apply it)")
+    s.add_argument("action", choices=["show", "set", "reset", "path"])
+    s.add_argument("key", nargs="?")
+    s.add_argument("value", nargs="?")
+    s.add_argument("--accent")
+    s.add_argument("--no-apply", action="store_true")
+    s.set_defaults(func=cmd_profile)
+
+    s = sub.add_parser("monitor", help="stream input state as JSON lines")
+    s.add_argument("--rate", type=int, default=30, help="max updates per second")
+    s.set_defaults(func=cmd_monitor)
+    return p
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    args.profile = os.path.expanduser(args.profile)
+    try:
+        args.func(args)
+    except ValueError as e:
+        die("error: %s" % e, 2)
+    except PermissionError as e:
+        die("permission denied: %s" % e, 4)
+    except OSError as e:
+        die("error: %s" % e, 2)
+
+
+if __name__ == "__main__":
+    main()
