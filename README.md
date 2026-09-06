@@ -101,6 +101,22 @@ button. The battery, lightbar, LEDs, triggers, audio and power-off all work
 over Bluetooth; USB and Bluetooth report the battery in 10% steps (5, 15, …,
 95, 100), which is what the controller sends.
 
+## Troubleshooting
+
+**The controller looks on but the widget says nothing is connected.** Over
+Bluetooth the input session can drop while the link itself stays up — the
+controller keeps its lights, but the kernel has no device left, so nothing can
+read the battery or set the lightbar. The panel detects this and offers
+**Reconnect** (`dualsense-ctl reconnect`, or
+`omarchy-shell atoslins.dualsense reconnect`). If the link stays down, press the
+PS button: the radio sleeps once the session ends.
+
+**The lightbar keeps its startup color.** The controller runs its own lightbar
+animation after connecting and ignores requested colors until it is handed
+control explicitly. Every command here that touches the lightbar sends that
+handover first, so this should not happen; if it does, **Reapply profile**
+forces it.
+
 ## Games
 
 The kernel driver exposes a standard gamepad, so SDL-based games and Steam
@@ -151,6 +167,7 @@ dualsense-ctl attenuation 2 0               # weaker rumble, full triggers
 dualsense-ctl monitor                       # live input as JSON lines
 dualsense-ctl profile set lightbar.color '#00ff88'
 dualsense-ctl apply                         # re-apply the profile
+dualsense-ctl reconnect                     # rebuild a stale Bluetooth link
 dualsense-ctl poweroff                      # Bluetooth only
 ```
 

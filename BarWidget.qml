@@ -47,6 +47,9 @@ Panel {
   property var _prev: ({})
   property var _lowNotified: ({})
   property var _queue: []
+  property var staleLinks: []
+  property string _pendingHex: ""
+  property real _pendingBrightness: -1
 
   readonly property bool vertical: bar ? bar.vertical === true : false
   readonly property color fg: bar ? bar.foreground : Color.foreground
@@ -210,10 +213,30 @@ Panel {
     setProfile("triggers.right.strength", v)
   }
 
+  // Dragging a slider emits a value per mouse move. One output report per event
+  // is fine over USB but floods the HID channel over Bluetooth, where the link
+  // drops when the send buffer fills. So previews coalesce to one report every
+  // ~90 ms, and skip the lightbar handover report — the profile commands that
+  // bracket the drag already did it.
   function previewLightbar(hex, brightness) {
     if (!canControl) return
-    preview.command = ["python3", helper].concat(deviceArgs()).concat(["lightbar", hex, "--brightness", String(Math.round(brightness))])
-    if (!preview.running) preview.running = true
+    _pendingHex = hex
+    _pendingBrightness = brightness
+    if (previewThrottle.running) return
+    flushPreview()
+    previewThrottle.start()
+  }
+
+  function flushPreview() {
+    if (_pendingHex === "" || !canControl || preview.running) return
+    preview.command = ["python3", helper].concat(deviceArgs())
+      .concat(["--no-release", "lightbar", _pendingHex, "--brightness", String(Math.round(_pendingBrightness))])
+    preview.running = true
+    _pendingHex = ""
+  }
+
+  function reconnectBluetooth() {
+    ctl(["reconnect"], function(code) { root.refresh() })
   }
 
   function applyProfile() {
@@ -270,6 +293,7 @@ Panel {
       return
     }
     root.helperOk = true
+    root.staleLinks = data.staleBluetooth || []
     var list = data.controllers
     var seen = {}
     var connectedNow = []
@@ -414,6 +438,16 @@ Panel {
     onTriggered: root.refresh()
   }
 
+  Timer {
+    id: previewThrottle
+    interval: 90
+    onTriggered: {
+      if (root._pendingHex === "") return
+      root.flushPreview()
+      previewThrottle.start()
+    }
+  }
+
   IpcHandler {
     target: "atoslins.dualsense"
 
@@ -426,6 +460,7 @@ Panel {
     function apply(): void { root.applyProfile() }
     function rumble(): void { root.testRumble() }
     function poweroff(): void { root.powerOff() }
+    function reconnect(): void { root.reconnectBluetooth() }
     function lightbar(color: string): void { root.setLightbarColor(String(color)) }
     function brightness(percent: int): void { root.setProfile("lightbar.brightness", Math.max(0, Math.min(100, percent))) }
     function player(number: int): void { root.setProfile("player.leds", Math.max(0, Math.min(7, number))) }
@@ -594,13 +629,42 @@ Panel {
           spacing: Style.space(6)
 
           Text {
-            visible: !root.connected && root.helperOk
+            visible: !root.connected && root.helperOk && root.staleLinks.length === 0
             width: parent.width
             wrapMode: Text.WordWrap
             text: "Plug the controller in with a USB-C cable, or pair it over Bluetooth: hold Create + PS until the lightbar blinks, then pick “Wireless Controller” in the Bluetooth menu."
             color: root.dim
             font.family: root.face
             font.pixelSize: Style.font.bodySmall
+          }
+
+          // Bluetooth still holds the link but the HID session is gone, so the
+          // controller looks on while nothing can talk to it.
+          Column {
+            visible: !root.connected && root.staleLinks.length > 0
+            width: parent.width
+            spacing: Style.space(8)
+
+            Text {
+              width: parent.width
+              wrapMode: Text.WordWrap
+              text: "The controller is still linked over Bluetooth, but its input session dropped. Reconnecting usually brings it back; if the link stays down, press the PS button to wake the radio."
+              color: root.urgent
+              font.family: root.face
+              font.pixelSize: Style.font.bodySmall
+            }
+
+            Button {
+              iconText: "󰂱"
+              text: root.busy ? "Reconnecting…" : "Reconnect"
+              tooltipText: "Drop the stale link and connect again"
+              fontSize: Style.font.bodySmall
+              foreground: root.fg
+              fontFamily: root.face
+              bordered: true
+              enabled: !root.busy
+              onClicked: root.reconnectBluetooth()
+            }
           }
 
           Text {

@@ -531,6 +531,25 @@ class Controller:
         finally:
             os.close(fd)
 
+    def release_lightbar(self):
+        """Hand lightbar control from the firmware to us.
+
+        The controller runs its own lightbar animation after connecting and
+        keeps that color, ignoring the RGB in output reports, until it receives
+        a lightbar-setup report on its own. The kernel does this once at probe
+        time (see dualsense_reset_leds in hid-playstation.c), but a controller
+        that reconnects, or one whose firmware finished booting after that
+        report, stays in its own mode — the visible symptom being a lightbar
+        stuck on the startup blue. Redoing the setup is harmless, so every
+        command that programs the lightbar sends this first.
+        """
+        common = self.new_common()
+        common[O_FLAG2] |= F2_LIGHTBAR_SETUP
+        common[O_LIGHTBAR_SETUP] = LIGHTBAR_SETUP_OFF
+        self.send(common)
+        # The firmware needs the two reports to arrive as separate messages.
+        time.sleep(0.02)
+
     def power_off(self):
         buf = bytearray(47)
         buf[0] = 0x08
@@ -823,8 +842,11 @@ def cmd_status(args):
             except OSError:
                 pass
     profile_file = args.profile
+    live = set(c["mac"] for c in controllers if c["mac"])
+    stale = [b for b in bluetooth_controllers() if b["mac"] not in live]
     payload = {
         "controllers": controllers,
+        "staleBluetooth": stale,
         "profile": load_profile(profile_file),
         "profileFile": profile_file,
         "accent": theme_accent(),
@@ -836,6 +858,9 @@ def cmd_status(args):
         return
     if not controllers:
         print("No DualSense controller connected")
+        for b in payload["staleBluetooth"]:
+            print("  %s is still paired and linked over Bluetooth but has no HID session." % b["mac"].upper())
+            print("  Run: dualsense-ctl reconnect   (press the PS button if it stays down)")
         return
     for c in controllers:
         b = c["battery"]
@@ -847,6 +872,34 @@ def cmd_status(args):
             print("  firmware: %s  update %s  built %s %s" % (fw["version"], fw["updateVersion"], fw["buildDate"], fw["buildTime"]))
 
 
+def bluetooth_controllers():
+    """Paired DualSense controllers that Bluetooth reports as connected.
+
+    A DualSense whose HID-over-Bluetooth session dies (the kernel tears down the
+    uhid node, bluetoothd logs a hidp write error) leaves the ACL link up: the
+    controller looks connected to BlueZ while no hidraw, input or battery node
+    exists. Listing these lets the caller tell "nothing is connected" apart from
+    "the link is stale and needs a reconnect".
+    """
+    if not which("bluetoothctl"):
+        return []
+    try:
+        out = subprocess.run(["bluetoothctl", "devices", "Connected"], timeout=5,
+                             capture_output=True, text=True).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    found = []
+    for line in out.splitlines():
+        parts = line.split(None, 2)
+        if len(parts) < 3 or parts[0] != "Device":
+            continue
+        mac, name = parts[1], parts[2].strip()
+        low = name.lower()
+        if "dualsense" in low or "wireless controller" in low:
+            found.append({"mac": mac.lower(), "name": name})
+    return found
+
+
 def which(name):
     for d in os.environ.get("PATH", "").split(os.pathsep):
         p = os.path.join(d, name)
@@ -855,9 +908,11 @@ def which(name):
     return None
 
 
-def send_to_each(args, fill, need_firmware=False):
+def send_to_each(args, fill, need_firmware=False, release=False):
     for info in select_controllers(args):
         with Controller(info) as ctl:
+            if release and not getattr(args, "no_release", False):
+                ctl.release_lightbar()
             common = ctl.new_common()
             fw = ctl.firmware() if need_firmware else None
             fill(ctl, common, fw)
@@ -875,10 +930,10 @@ def cmd_lightbar(args):
     if text == "on":
         lb = load_profile(args.profile)["lightbar"]
         rgb = parse_color(theme_accent() if lb.get("followTheme") and theme_accent() else lb["color"])
-        send_to_each(args, lambda ctl, c, fw: ctl.fill_lightbar(c, rgb, lb.get("brightness", 100)))
+        send_to_each(args, lambda ctl, c, fw: ctl.fill_lightbar(c, rgb, lb.get("brightness", 100)), release=True)
         return
     rgb = parse_color(text)
-    send_to_each(args, lambda ctl, c, fw: ctl.fill_lightbar(c, rgb, args.brightness))
+    send_to_each(args, lambda ctl, c, fw: ctl.fill_lightbar(c, rgb, args.brightness), release=True)
 
 
 def cmd_player(args):
@@ -972,11 +1027,46 @@ def cmd_disconnect(args):
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
+def cmd_reconnect(args):
+    """Rebuild a Bluetooth link whose HID session died.
+
+    Dropping the stale ACL link is the part that always works; bringing it back
+    needs the controller's radio awake, which is why the PS button may still be
+    required.
+    """
+    if not which("bluetoothctl"):
+        die("bluetoothctl not found", 2)
+    targets = []
+    if args.device:
+        targets = [args.device.lower()]
+    else:
+        targets = [b["mac"] for b in bluetooth_controllers()]
+        targets += [c["mac"] for c in find_controllers() if c["bus"] == "bluetooth" and c["mac"]]
+    targets = sorted(set(t for t in targets if t))
+    if not targets:
+        die("No Bluetooth controller to reconnect. Press the PS button, or plug in the cable.", 3)
+    ok = False
+    for mac in targets:
+        subprocess.run(["bluetoothctl", "disconnect", mac.upper()], check=False, timeout=15,
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(1.0)
+        r = subprocess.run(["bluetoothctl", "connect", mac.upper()], check=False, timeout=20,
+                           capture_output=True, text=True)
+        # bluetoothctl exits 0 even when the attempt failed, so read the text.
+        if "successful" in (r.stdout or "").lower():
+            ok = True
+    if not ok:
+        die("Could not bring the link back up. Press the PS button on the controller "
+            "(its radio sleeps after the link drops), or connect the USB-C cable.", 6)
+
+
 def cmd_apply(args):
     profile = load_profile(args.profile)
     accent = args.accent or theme_accent()
     for info in select_controllers(args):
         with Controller(info) as ctl:
+            if not getattr(args, "no_release", False):
+                ctl.release_lightbar()
             ctl.send(build_profile_report(ctl, profile, accent))
 
 
@@ -1000,6 +1090,8 @@ def cmd_profile(args):
         try:
             for info in select_controllers(args):
                 with Controller(info) as ctl:
+                    if not getattr(args, "no_release", False):
+                        ctl.release_lightbar()
                     ctl.send(build_profile_report(ctl, profile, accent))
         except SystemExit:
             pass
@@ -1042,6 +1134,9 @@ def build_parser():
     p.add_argument("--all", action="store_true", help="apply to every connected controller")
     p.add_argument("--profile", default=os.environ.get("DUALSENSE_PROFILE", DEFAULT_PROFILE_FILE),
                    help="profile file (default %s)" % DEFAULT_PROFILE_FILE)
+    p.add_argument("--no-release", action="store_true",
+                   help="skip the lightbar handover report (for rapid previews, once the "
+                        "lightbar is already under host control)")
     p.add_argument("--version", action="version", version="dualsense-ctl " + VERSION)
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -1114,6 +1209,9 @@ def build_parser():
 
     s = sub.add_parser("disconnect", help="drop the Bluetooth link (bluetoothctl)")
     s.set_defaults(func=cmd_disconnect)
+
+    s = sub.add_parser("reconnect", help="drop and rebuild a stale Bluetooth link")
+    s.set_defaults(func=cmd_reconnect)
 
     s = sub.add_parser("apply", help="apply the saved profile")
     s.add_argument("--accent", help="theme accent color for lightbar.followTheme")
