@@ -108,8 +108,31 @@ Bluetooth the input session can drop while the link itself stays up — the
 controller keeps its lights, but the kernel has no device left, so nothing can
 read the battery or set the lightbar. The panel detects this and offers
 **Reconnect** (`dualsense-ctl reconnect`, or
-`omarchy-shell atoslins.dualsense reconnect`). If the link stays down, press the
-PS button: the radio sleeps once the session ends.
+`omarchy-shell atoslins.dualsense reconnect`), which only ever tries to connect:
+a DualSense powers itself off the instant the host drops its link, so
+disconnecting first would turn a recoverable state into a controller that is
+simply off. When connecting does not take, the PS button is the only way back.
+
+**It keeps dropping every few minutes.** Look for this in `journalctl -u bluetooth`:
+
+```
+bluetoothd: profiles/input/device.c:hidp_send_message() BT socket write error:
+Resource temporarily unavailable (11)
+```
+
+That is the L2CAP send buffer filling up, and BlueZ tears the HID session down
+when it happens. A connected DualSense streams ~220 input reports a second, so
+the link has little headroom, and combo Wi-Fi/Bluetooth chips (MediaTek MT7921,
+some Intel and Realtek parts) share a radio between both. The usual fix is to
+turn off L2CAP retransmission mode, which is what keeps the buffer blocked:
+
+```bash
+echo 'options bluetooth disable_ertm=1' | sudo tee /etc/modprobe.d/bluetooth-ertm.conf
+sudo sh -c 'echo 1 > /sys/module/bluetooth/parameters/disable_ertm'   # until reboot
+```
+
+Reconnect the controller afterwards; the setting applies to new links. The USB-C
+cable is unaffected by all of this.
 
 **The lightbar keeps its startup color.** The controller runs its own lightbar
 animation after connecting and ignores requested colors until it is handed

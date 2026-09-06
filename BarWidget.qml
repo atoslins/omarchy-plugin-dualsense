@@ -648,7 +648,7 @@ Panel {
             Text {
               width: parent.width
               wrapMode: Text.WordWrap
-              text: "The controller is still linked over Bluetooth, but its input session dropped. Reconnecting usually brings it back; if the link stays down, press the PS button to wake the radio."
+              text: "The controller is still linked over Bluetooth, but its input session dropped. Try Reconnect; if that does not take, press the PS button. Dropping the link is deliberately not attempted — a DualSense powers itself off when the host disconnects it."
               color: root.urgent
               font.family: root.face
               font.pixelSize: Style.font.bodySmall
