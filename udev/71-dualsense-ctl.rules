@@ -3,9 +3,14 @@
 # triggers and audio without root. Not needed when the steam-devices package
 # is installed — it ships the same rules.
 #
-# Install:  sudo cp 71-dualsense-ctl.rules /etc/udev/rules.d/
-#           sudo udevadm control --reload && sudo udevadm trigger
-# then reconnect the controller.
+# Install with the verifier that ships next to this file — it checks the SHA-256
+# of these bytes before and after copying them as root, so nothing but the
+# reviewed rule can land in /etc/udev/rules.d:
+#
+#   sudo ./install-udev-rule
+#
+# then reconnect the controller. `./install-udev-rule check` reports the state,
+# `sudo ./install-udev-rule remove` takes it out again.
 
 # DualSense over USB / Bluetooth
 KERNEL=="hidraw*", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="0ce6", MODE="0660", TAG+="uaccess"

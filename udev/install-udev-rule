@@ -1,0 +1,279 @@
+#!/usr/bin/env python3
+"""install-udev-rule — privileged, digest-bound installer for 71-dualsense-ctl.rules.
+
+Why this exists instead of `sudo cp`: the rule ships inside the user's home,
+which the desktop user (or anything running as them) can rewrite at any moment,
+including between the password prompt and the copy. A udev rule installed from
+attacker-chosen bytes can hand out device permissions or run root-context
+actions, so the privileged step has to be bound to the exact bytes that were
+reviewed. This script:
+
+  1. pins the SHA-256 of the shipped rule (EXPECTED_SHA256, set at release);
+  2. opens the source with O_NOFOLLOW and checks the descriptor it actually got:
+     regular file, single link, not world-writable, owned by root or the user
+     who invoked sudo/pkexec;
+  3. hashes the bytes it actually read and aborts on any mismatch;
+  4. writes those same bytes to a root-owned 0644 staging file created with
+     O_EXCL inside /etc/udev/rules.d, fsyncs it, re-opens and re-verifies it;
+  5. renames it atomically over the destination, fsyncs the directory, re-opens
+     the installed file and verifies it once more, removing it on mismatch;
+  6. only then reloads udev.
+
+Nothing is written before step 3 passes, and every abort removes the staging
+file. Exit codes: 0 ok, 1 not installed (check), 2 mismatch/refused, 3 usage or
+permission error, 4 udev reload failed after a successful install.
+
+    sudo ./install-udev-rule            # install
+    ./install-udev-rule check           # installed? matches the reviewed bytes?
+    sudo ./install-udev-rule remove     # remove, only if the installed file is ours
+"""
+
+import argparse
+import errno
+import hashlib
+import hmac
+import os
+import stat
+import subprocess
+import sys
+
+RULE_NAME = "71-dualsense-ctl.rules"
+EXPECTED_SHA256 = "2e114342f85cb8237c11c822221e0d0c255ccf552f5d581fe31dfef4ac9e2264"
+DEST_DIR = "/etc/udev/rules.d"
+MAX_SIZE = 64 * 1024
+OPEN_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NOCTTY
+
+
+class Abort(Exception):
+    def __init__(self, message, code=2):
+        super().__init__(message)
+        self.code = code
+
+
+def sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def invoking_uids():
+    """uids allowed to own the source: root plus whoever invoked sudo/pkexec."""
+    uids = {0, os.getuid()}
+    for var in ("SUDO_UID", "PKEXEC_UID"):
+        value = os.environ.get(var, "")
+        if value.isdigit():
+            uids.add(int(value))
+    return uids
+
+
+def read_verified(fd, what, allowed_uids, expect_mode=None):
+    """fstat the descriptor, read its bytes, and prove they are the reviewed rule."""
+    st = os.fstat(fd)
+    if not stat.S_ISREG(st.st_mode):
+        raise Abort("%s is not a regular file" % what)
+    if st.st_nlink != 1:
+        raise Abort("%s has %d hard links; expected exactly one" % (what, st.st_nlink))
+    if st.st_mode & stat.S_IWOTH:
+        raise Abort("%s is world-writable" % what)
+    if st.st_uid not in allowed_uids:
+        raise Abort("%s is owned by uid %d; expected one of %s"
+                    % (what, st.st_uid, sorted(allowed_uids)))
+    if expect_mode is not None and stat.S_IMODE(st.st_mode) != expect_mode:
+        raise Abort("%s has mode %o; expected %o" % (what, stat.S_IMODE(st.st_mode), expect_mode))
+    if st.st_size > MAX_SIZE:
+        raise Abort("%s is %d bytes; a udev rule this size is not ours" % (what, st.st_size))
+    chunks = []
+    total = 0
+    while True:
+        chunk = os.read(fd, 65536)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > MAX_SIZE:
+            raise Abort("%s grew past %d bytes while being read" % (what, MAX_SIZE))
+        chunks.append(chunk)
+    data = b"".join(chunks)
+    actual = sha256(data)
+    if not hmac.compare_digest(actual, EXPECTED_SHA256):
+        raise Abort("%s does not match the reviewed rule\n  sha256   %s\n  expected %s"
+                    % (what, actual, EXPECTED_SHA256))
+    return data
+
+
+def open_source(path, allowed_uids):
+    try:
+        fd = os.open(path, OPEN_FLAGS)
+    except OSError as e:
+        if e.errno == errno.ELOOP:
+            raise Abort("source %s is a symbolic link; refusing to follow it" % path)
+        raise Abort("cannot open source %s: %s" % (path, e.strerror), 3)
+    try:
+        return read_verified(fd, "source rule %s" % path, allowed_uids)
+    finally:
+        os.close(fd)
+
+
+def open_dest_dir(path, privileged):
+    try:
+        dfd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError as e:
+        raise Abort("cannot open %s: %s" % (path, e.strerror), 3)
+    st = os.fstat(dfd)
+    if not stat.S_ISDIR(st.st_mode):
+        os.close(dfd)
+        raise Abort("%s is not a directory" % path, 3)
+    if privileged and (st.st_uid != 0 or st.st_mode & stat.S_IWOTH):
+        os.close(dfd)
+        raise Abort("%s must be owned by root and not world-writable" % path, 3)
+    return dfd
+
+
+def reload_udev():
+    try:
+        subprocess.run(["udevadm", "control", "--reload"], check=True)
+        subprocess.run(["udevadm", "trigger", "--subsystem-match=hidraw",
+                        "--subsystem-match=input"], check=True)
+    except (OSError, subprocess.CalledProcessError) as e:
+        raise Abort("rule installed, but reloading udev failed (%s); reconnect the controller "
+                    "or run: udevadm control --reload && udevadm trigger" % e, 4)
+
+
+def cmd_install(args, privileged):
+    allowed = invoking_uids()
+    data = open_source(args.source, allowed)
+    dfd = open_dest_dir(args.dest_dir, privileged)
+    staging = ".%s.%d.tmp" % (RULE_NAME, os.getpid())
+    owner_uids = {0} if privileged else {os.getuid()}
+    try:
+        try:
+            tfd = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+                          0o644, dir_fd=dfd)
+        except OSError as e:
+            raise Abort("cannot create staging file in %s: %s" % (args.dest_dir, e.strerror), 3)
+        try:
+            view = memoryview(data)
+            while view:
+                written = os.write(tfd, view)
+                view = view[written:]
+            os.fchmod(tfd, 0o644)
+            if privileged:
+                os.fchown(tfd, 0, 0)
+            os.fsync(tfd)
+        finally:
+            os.close(tfd)
+
+        vfd = os.open(staging, OPEN_FLAGS, dir_fd=dfd)
+        try:
+            read_verified(vfd, "staged copy", owner_uids, expect_mode=0o644)
+        finally:
+            os.close(vfd)
+
+        os.rename(staging, RULE_NAME, src_dir_fd=dfd, dst_dir_fd=dfd)
+        os.fsync(dfd)
+    except BaseException:
+        try:
+            os.unlink(staging, dir_fd=dfd)
+        except OSError:
+            pass
+        raise
+
+    ifd = os.open(RULE_NAME, OPEN_FLAGS, dir_fd=dfd)
+    try:
+        read_verified(ifd, "installed rule", owner_uids, expect_mode=0o644)
+    except Abort:
+        os.close(ifd)
+        ifd = None
+        try:
+            os.unlink(RULE_NAME, dir_fd=dfd)
+        except OSError:
+            pass
+        raise
+    finally:
+        if ifd is not None:
+            os.close(ifd)
+    os.close(dfd)
+
+    print("installed %s (sha256 %s)" % (os.path.join(args.dest_dir, RULE_NAME), EXPECTED_SHA256))
+    if not args.no_reload:
+        reload_udev()
+        print("udev reloaded; reconnect the controller if it was already plugged in")
+
+
+def cmd_check(args, privileged):
+    dfd = open_dest_dir(args.dest_dir, False)
+    try:
+        try:
+            fd = os.open(RULE_NAME, OPEN_FLAGS, dir_fd=dfd)
+        except OSError as e:
+            if e.errno == errno.ENOENT:
+                print("not installed: %s" % os.path.join(args.dest_dir, RULE_NAME))
+                return 1
+            raise Abort("cannot open installed rule: %s" % e.strerror, 3)
+        try:
+            read_verified(fd, "installed rule", {0, os.getuid()})
+        finally:
+            os.close(fd)
+    finally:
+        os.close(dfd)
+    print("installed and matches the reviewed rule (sha256 %s)" % EXPECTED_SHA256)
+    return 0
+
+
+def cmd_remove(args, privileged):
+    dfd = open_dest_dir(args.dest_dir, privileged)
+    try:
+        try:
+            fd = os.open(RULE_NAME, OPEN_FLAGS, dir_fd=dfd)
+        except OSError as e:
+            if e.errno == errno.ENOENT:
+                print("nothing to remove")
+                return 0
+            raise Abort("cannot open installed rule: %s" % e.strerror, 3)
+        try:
+            if not args.force:
+                read_verified(fd, "installed rule", {0, os.getuid()})
+        finally:
+            os.close(fd)
+        os.unlink(RULE_NAME, dir_fd=dfd)
+        os.fsync(dfd)
+    finally:
+        os.close(dfd)
+    print("removed %s" % os.path.join(args.dest_dir, RULE_NAME))
+    if not args.no_reload:
+        reload_udev()
+    return 0
+
+
+def main(argv=None):
+    here = os.path.dirname(os.path.realpath(__file__))
+    p = argparse.ArgumentParser(prog="install-udev-rule", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("command", nargs="?", default="install", choices=["install", "check", "remove"])
+    p.add_argument("--source", default=os.path.join(here, RULE_NAME),
+                   help="rule file to install (default: the one next to this script)")
+    p.add_argument("--dest-dir", default=DEST_DIR,
+                   help="rules directory (default %s; anything else runs unprivileged, for tests)" % DEST_DIR)
+    p.add_argument("--no-reload", action="store_true", help="do not reload udev afterwards")
+    p.add_argument("--force", action="store_true",
+                   help="remove: delete even if the installed file is not the reviewed rule")
+    args = p.parse_args(argv)
+
+    privileged = args.dest_dir == DEST_DIR
+    if privileged and args.command in ("install", "remove") and os.geteuid() != 0:
+        sys.stderr.write("run as root: sudo %s %s\n" % (sys.argv[0], args.command))
+        return 3
+    if "@@" in EXPECTED_SHA256:
+        sys.stderr.write("this copy of the installer has no pinned digest; refusing\n")
+        return 3
+    try:
+        if args.command == "install":
+            cmd_install(args, privileged)
+            return 0
+        if args.command == "check":
+            return cmd_check(args, privileged)
+        return cmd_remove(args, privileged)
+    except Abort as e:
+        sys.stderr.write("aborted: %s\n" % e)
+        return e.code
+
+
+if __name__ == "__main__":
+    sys.exit(main())

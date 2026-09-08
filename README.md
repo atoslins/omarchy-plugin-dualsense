@@ -81,17 +81,30 @@ The profile in `~/.config/dualsense/` stays; delete it if you want.
 
 The plugin writes to the controller's hidraw node. Steam's `steam-devices`
 package already grants that to the logged-in user, so if Steam is installed
-you are done. Otherwise install the rule shipped in `udev/`:
+you are done. Otherwise install the rule shipped in `udev/` with the verifier
+that sits next to it:
 
 ```bash
-sudo cp ~/.config/omarchy/plugins/atoslins.dualsense/udev/71-dualsense-ctl.rules /etc/udev/rules.d/
-sudo udevadm control --reload && sudo udevadm trigger
+sudo ~/.config/omarchy/plugins/atoslins.dualsense/udev/install-udev-rule
 ```
 
 then reconnect the controller. The same rule also opens the motion-sensor and
 touchpad input nodes, which the **Test** tab needs for gyro, accelerometer and
 touches (the gamepad itself works without it). The panel tells you when
 access is missing.
+
+The verifier exists because a plain `sudo cp` would copy whatever is in your
+home directory at the moment the privileged copy runs, and a udev rule is
+system policy. `install-udev-rule` (Python 3, standard library) pins the
+SHA-256 of the reviewed rule, opens the source without following symlinks,
+checks that the descriptor is a regular, single-link, non-world-writable file
+owned by root or by you, hashes the bytes it actually read, writes those bytes
+to a root-owned staging file created with `O_EXCL` in `/etc/udev/rules.d`,
+verifies the staged copy, renames it atomically, verifies the installed file
+again, and only then reloads udev. Any mismatch aborts, removes what it
+staged, and installs nothing. `install-udev-rule check` reports the state
+without root; `sudo install-udev-rule remove` takes the rule out, refusing to
+delete a file that is not the reviewed one unless you pass `--force`.
 
 ## Bluetooth
 
@@ -201,7 +214,8 @@ Add `--device MAC` to pick a controller, `--all` for every one.
 - Omarchy 4 (Quattro) shell.
 - Linux `hid_playstation` driver (kernel 5.12+, built into Omarchy).
 - `python3` (already required by Omarchy), `udevadm` (systemd).
-- Read/write access to the controller's hidraw node — see **Permissions**.
+- Read/write access to the controller's hidraw node — see **Permissions**
+  (`udev/install-udev-rule` installs the bundled rule with digest verification).
 - Optional: `bluetoothctl` for the disconnect button.
 
 ## Credits

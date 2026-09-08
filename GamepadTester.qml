@@ -138,7 +138,7 @@ Item {
       width: parent.width
       wrapMode: Text.WordWrap
       text: (!root.hasMotion && !root.hasTouch ? "Motion sensors and touchpad" : !root.hasMotion ? "Motion sensors" : "Touchpad")
-        + " need read access to their input nodes — install the udev rule from the plugin's udev/ folder (see README) and reconnect."
+        + " need read access to their input nodes — run the plugin's udev/install-udev-rule as root (see README) and reconnect."
       color: root.dim
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption

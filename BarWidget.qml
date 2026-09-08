@@ -671,7 +671,7 @@ Panel {
             visible: root.connected && !root.canControl
             width: parent.width
             wrapMode: Text.WordWrap
-            text: "No permission to write to " + (root.device ? root.device.node : "the controller") + ". Install the udev rule shipped with this plugin (see README) or the steam-devices package, then reconnect."
+            text: "No permission to write to " + (root.device ? root.device.node : "the controller") + ". Run the plugin's udev/install-udev-rule as root (see README) or install the steam-devices package, then reconnect."
             color: root.urgent
             font.family: root.face
             font.pixelSize: Style.font.bodySmall
