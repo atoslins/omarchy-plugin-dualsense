@@ -201,8 +201,9 @@ Panel {
     ctl(["--all", "profile", "set", "lightbar.color", JSON.stringify(hex), "--accent", accentHex])
   }
 
+  // side is "left", "right" or "both" (the IPC), whatever the link toggle says.
   function setTrigger(side, effect) {
-    if (linkTriggers) {
+    if (linkTriggers || side === "both") {
       setProfile("triggers.left.effect", effect)
       setProfile("triggers.right.effect", effect)
     } else {
