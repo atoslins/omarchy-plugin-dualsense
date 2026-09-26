@@ -56,6 +56,7 @@ Panel {
   property string selectedMac: ""
   property var profile: null
   property string themeAccent: ""
+  property string helperVersion: ""
   property bool helperOk: true
   property string lastError: ""
   property bool busy: false
@@ -358,6 +359,7 @@ Panel {
     root.controllers = list
     if (data.profile) root.profile = data.profile
     root.themeAccent = data.accent || ""
+    root.helperVersion = data.version || ""
     var stillThere = false
     for (var j = 0; j < list.length; j++) if (list[j].mac === root.selectedMac) stillThere = true
     if (!stillThere) root.selectedMac = list.length > 0 ? String(list[0].mac) : ""
@@ -1262,7 +1264,8 @@ Panel {
               { label: "Input node", value: root.device.event || "—" },
               { label: "Motion", value: (root.device.motion || "—") + (root.device.motion && !(root.device.access && root.device.access.motion) ? " · no access" : "") },
               { label: "Touchpad", value: (root.device.touchpad || "—") + (root.device.touchpad && !(root.device.access && root.device.access.touchpad) ? " · no access" : "") },
-              { label: "Profile", value: root.profileSetting }
+              { label: "Profile", value: root.profileSetting },
+              { label: "Plugin", value: root.helperVersion || "—" }
             ] : []
 
             Item {

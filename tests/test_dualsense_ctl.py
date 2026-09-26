@@ -11,12 +11,14 @@ import io
 import json
 import os
 import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 import zlib
 from unittest import mock
 
-from support import load, manifest
+from support import ROOT, load, manifest
 
 ctl = load("bin/dualsense-ctl", "dualsense_ctl")
 
@@ -361,6 +363,14 @@ class StatusTest(unittest.TestCase):
     def test_version_is_the_manifest_version(self):
         self.assertEqual(ctl.VERSION, manifest()["version"])
         self.assertEqual(self.status()["version"], manifest()["version"])
+
+    def test_version_through_a_symlink(self):
+        # The README suggests linking the helper into ~/.local/bin.
+        with tempfile.TemporaryDirectory() as tmp:
+            link = os.path.join(tmp, "dualsense-ctl")
+            os.symlink(os.path.join(ROOT, "bin", "dualsense-ctl"), link)
+            out = subprocess.run([sys.executable, "-B", link, "--version"], capture_output=True, text=True)
+        self.assertEqual(out.stdout.strip(), "dualsense-ctl " + manifest()["version"])
 
 
 if __name__ == "__main__":

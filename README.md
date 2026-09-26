@@ -28,7 +28,8 @@ driver, with no extra packages.
     sticks move, triggers fill, touches show on the touchpad, gyro and
     accelerometer read out below.
   - **Info**: model, connection, address, firmware build, hardware revision,
-    kernel driver and device nodes, with permission problems called out.
+    kernel driver and device nodes, with permission problems called out, and
+    the plugin version (worth including in a bug report).
 - Everything you pick is saved to a profile and re-applied automatically when
   a controller connects (the kernel resets the lightbar on every connection).
 - Desktop notifications (via the Omarchy shell) for: controller connected /
