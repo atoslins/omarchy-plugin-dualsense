@@ -424,6 +424,14 @@ Panel {
     onRunningChanged: if (!running) root.live = null
   }
 
+  // A running Process keeps its original command, so switching controllers
+  // left the tester reading the old one. Restart it on the new --device.
+  readonly property string testerMac: connected ? String(device.mac) : ""
+  onTesterMacChanged: if (monitor.running) {
+    root.testerOn = false
+    Qt.callLater(function() { root.testerOn = true })
+  }
+
   Timer {
     interval: (root.opened ? 2 : root.pollSeconds) * 1000
     repeat: true
