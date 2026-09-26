@@ -402,7 +402,9 @@ Panel {
     id: preview
   }
 
-  // Hot-plug: refresh the moment a hidraw device appears or disappears.
+  // Hot-plug: refresh the moment a hidraw device appears or disappears. With
+  // no controller around this is what notices one arriving, so it is
+  // restarted whenever it exits.
   Process {
     id: hotplug
     running: true
@@ -412,6 +414,13 @@ Panel {
         if (/\b(add|remove|bind|unbind)\b/.test(line)) refreshSoon.restart()
       }
     }
+    onExited: hotplugRestart.start()
+  }
+
+  Timer {
+    id: hotplugRestart
+    interval: 5000
+    onTriggered: hotplug.running = true
   }
 
   // Live input for the tester tab.
@@ -435,8 +444,13 @@ Panel {
     Qt.callLater(function() { root.testerOn = true })
   }
 
+  // With nothing connected the only news is a controller arriving, which the
+  // udev monitor reports at once, so polling idles at a minute; that still
+  // catches a Bluetooth link going stale or away without a hidraw event.
+  readonly property bool idle: controllers.length === 0 && staleLinks.length === 0
+
   Timer {
-    interval: (root.opened ? 2 : root.pollSeconds) * 1000
+    interval: (root.opened ? 2 : root.idle ? Math.max(60, root.pollSeconds) : root.pollSeconds) * 1000
     repeat: true
     running: true
     triggeredOnStart: true

@@ -35,8 +35,9 @@ driver, with no extra packages.
   disconnected, battery low, fully charged.
 - Power off / disconnect buttons when the controller is on Bluetooth.
 - Several controllers: a picker appears and each one is handled separately.
-- Hot-plug aware (udev), polling every 5 s otherwise and every 2 s while the
-  panel is open.
+- Hot-plug aware (udev): a controller shows up the moment it connects. While
+  one is connected the widget polls every 5 s (2 s with the panel open); with
+  none it checks once a minute.
 
 ## Interactions
 
@@ -166,7 +167,8 @@ it exits; the plugin re-applies your profile on the next connection or with
 
 In the widget's entry in `~/.config/omarchy/shell.json`:
 
-- `pollSeconds` (default `5`) — idle polling interval.
+- `pollSeconds` (default `5`) — polling interval while a controller is
+  connected and the panel is closed.
 - `notifications` (default `true`) — desktop notifications.
 - `lowBattery` (default `20`) — percentage that counts as low.
 - `applyOnConnect` (default `true`) — re-apply the profile when a controller
