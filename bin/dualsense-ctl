@@ -228,6 +228,15 @@ def save_profile(path, profile):
     os.replace(tmp, path)
 
 
+def to_int(key, value):
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise ValueError("%s must be a number" % key)
+    try:
+        return int(value)
+    except (ValueError, OverflowError):
+        raise ValueError("%s must be a number" % key) from None
+
+
 def profile_set(profile, key, raw):
     """Set a dotted key ('lightbar.color') to a JSON-ish value, validating."""
     parts = key.split(".")
@@ -247,11 +256,11 @@ def profile_set(profile, key, raw):
     if key == "lightbar.color":
         value = color_hex(parse_color(value))
     elif key == "lightbar.brightness":
-        value = clamp(int(value), 0, 100)
+        value = clamp(to_int(key, value), 0, 100)
     elif key in ("lightbar.enabled", "lightbar.followTheme", "player.fade", "audio.micMuted"):
         value = bool(value) if not isinstance(value, str) else value.lower() in ("1", "true", "on", "yes")
     elif key == "player.leds":
-        value = clamp(int(value), 0, len(PLAYER_PATTERNS) - 1)
+        value = clamp(to_int(key, value), 0, len(PLAYER_PATTERNS) - 1)
     elif key == "player.brightness":
         if value not in LED_BRIGHTNESS:
             raise ValueError("brightness must be high, medium or low")
@@ -259,7 +268,7 @@ def profile_set(profile, key, raw):
         if value not in TRIGGER_EFFECTS:
             raise ValueError("effect must be one of " + ", ".join(TRIGGER_EFFECTS))
     elif key.endswith(".strength"):
-        value = clamp(int(value), 1, 8)
+        value = clamp(to_int(key, value), 1, 8)
     elif key == "audio.micLed":
         if value not in ("auto", "off", "on", "pulse"):
             raise ValueError("micLed must be auto, off, on or pulse")
@@ -267,9 +276,9 @@ def profile_set(profile, key, raw):
         if value is not None and value not in SPEAKER_ROUTES:
             raise ValueError("speaker must be headphone, internal, both or mono")
     elif key in ("audio.volume", "audio.micVolume"):
-        value = None if value is None or value == "" else clamp(int(value), 0, 100)
+        value = None if value is None or value == "" else clamp(to_int(key, value), 0, 100)
     elif key in ("motors.rumble", "motors.trigger"):
-        value = clamp(int(value), 0, 7)
+        value = clamp(to_int(key, value), 0, 7)
     node[leaf] = value
     return value
 
@@ -1047,7 +1056,7 @@ def cmd_poweroff(args):
             except OSError:
                 pass
         if which("bluetoothctl") and info["mac"]:
-            subprocess.run(["bluetoothctl", "disconnect", info["mac"].upper()], check=False,
+            subprocess.run(["bluetoothctl", "disconnect", info["mac"].upper()], check=False, timeout=10,
                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         else:
             die("Could not power off " + info["id"], 2)
@@ -1059,7 +1068,7 @@ def cmd_disconnect(args):
             die("%s is on USB — unplug the cable to disconnect" % info["model"], 5)
         if not which("bluetoothctl"):
             die("bluetoothctl not found", 2)
-        subprocess.run(["bluetoothctl", "disconnect", info["mac"].upper()], check=False,
+        subprocess.run(["bluetoothctl", "disconnect", info["mac"].upper()], check=False, timeout=10,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
@@ -1085,8 +1094,11 @@ def cmd_reconnect(args):
         die("No Bluetooth controller to reconnect. Press the PS button to wake it, "
             "or plug in the USB-C cable.", 3)
     for mac in targets:
-        r = subprocess.run(["bluetoothctl", "connect", mac.upper()], check=False, timeout=25,
-                           capture_output=True, text=True)
+        try:
+            r = subprocess.run(["bluetoothctl", "connect", mac.upper()], check=False, timeout=25,
+                               capture_output=True, text=True)
+        except subprocess.TimeoutExpired:
+            continue
         # bluetoothctl exits 0 even when the attempt failed, so read the text.
         if "successful" in (r.stdout or "").lower():
             return
@@ -1275,6 +1287,8 @@ def main(argv=None):
     except PermissionError as e:
         die("permission denied: %s" % e, 4)
     except OSError as e:
+        die("error: %s" % e, 2)
+    except subprocess.SubprocessError as e:
         die("error: %s" % e, 2)
 
 

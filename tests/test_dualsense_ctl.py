@@ -249,6 +249,69 @@ class ProfileFileTest(unittest.TestCase):
         self.assertFalse(os.path.exists(self.path + ".tmp"))
 
 
+class CleanErrorsTest(unittest.TestCase):
+    """Failures reach the panel as the last line of stderr, so they have to be
+    one readable line with a meaningful exit code, never a traceback."""
+
+    def run_main(self, argv):
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as exit:
+            ctl.main(argv)
+        return exit.exception.code, err.getvalue()
+
+    def test_profile_set_null_number(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, err = self.run_main(["--profile", os.path.join(tmp, "p.json"),
+                                       "profile", "set", "player.leds", "null", "--no-apply"])
+        self.assertEqual(code, 2)
+        self.assertIn("player.leds must be a number", err)
+
+    def test_profile_set_rejects_non_numbers(self):
+        for key, raw in [("player.leds", "null"), ("lightbar.brightness", "[50]"),
+                         ("triggers.left.strength", "true"), ("motors.trigger", '{"a": 1}')]:
+            with self.subTest(key=key, raw=raw):
+                with self.assertRaises(ValueError):
+                    ctl.profile_set(fresh_profile(), key, raw)
+
+    def reconnect(self, outcomes):
+        run = mock.Mock(side_effect=outcomes)
+        with mock.patch.object(ctl, "which", return_value="/usr/bin/bluetoothctl"), \
+                mock.patch.object(ctl, "find_controllers", return_value=[]), \
+                mock.patch.object(ctl, "bluetooth_controllers",
+                                  return_value=[{"mac": "aa:aa"}, {"mac": "bb:bb"}]), \
+                mock.patch.object(ctl.subprocess, "run", run):
+            try:
+                ctl.main(["reconnect"])
+            finally:
+                self.calls = [c.args[0][-1] for c in run.call_args_list]
+
+    def test_reconnect_timeout_moves_on(self):
+        timeout = ctl.subprocess.TimeoutExpired(["bluetoothctl", "connect", "AA:AA"], 25)
+        ok = ctl.subprocess.CompletedProcess([], 0, stdout="Connection successful\n", stderr="")
+        self.reconnect([timeout, ok])
+        self.assertEqual(self.calls, ["AA:AA", "BB:BB"])
+
+    def test_reconnect_all_timeouts(self):
+        timeout = ctl.subprocess.TimeoutExpired(["bluetoothctl", "connect"], 25)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(SystemExit) as exit:
+            self.reconnect([timeout, timeout])
+        self.assertEqual(exit.exception.code, 6)
+        self.assertIn("Press the PS button", err.getvalue())
+
+    def test_bluetoothctl_that_hangs(self):
+        info = {"id": "aa:aa", "mac": "aa:aa", "model": "DualSense", "bus": "bluetooth",
+                "node": "/dev/hidraw-test", "access": {"hidraw": True}}
+        timeout = ctl.subprocess.TimeoutExpired(["bluetoothctl", "disconnect", "AA:AA"], 10)
+        with mock.patch.object(ctl, "which", return_value="/usr/bin/bluetoothctl"), \
+                mock.patch.object(ctl, "find_controllers", return_value=[info]), \
+                mock.patch.object(ctl.subprocess, "run", side_effect=timeout) as run:
+            code, err = self.run_main(["disconnect"])
+        self.assertIn("timeout", run.call_args.kwargs)
+        self.assertEqual(code, 2)
+        self.assertIn("timed out", err)
+
+
 class RumbleTest(unittest.TestCase):
     def controller(self, hidraw, event):
         return {"id": "aa:bb", "mac": "aa:bb", "model": "DualSense", "bus": "usb",
