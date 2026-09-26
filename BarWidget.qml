@@ -67,6 +67,8 @@ Panel {
   }
   readonly property bool connected: device !== null
   readonly property bool canControl: connected && device.access && device.access.hidraw === true
+  readonly property bool canRumble: connected && device.access
+    && (device.access.event === true || device.access.hidraw === true)
   readonly property bool bluetooth: connected && device.bus === "bluetooth"
   readonly property int capacity: connected && device.battery && device.battery.capacity !== null
     ? device.battery.capacity : -1
@@ -1040,17 +1042,22 @@ Panel {
             fontFamily: root.face
             onReleased: function(v) { root.setProfile("motors.trigger", 8 - Math.round(v)) }
           }
+        }
 
-          Button {
-            iconText: "󰕦"
-            text: "Test rumble"
-            tooltipText: "Half a second on both motors, through the same force-feedback path games use"
-            fontSize: Style.font.bodySmall
-            foreground: root.fg
-            fontFamily: root.face
-            bordered: true
-            onClicked: root.testRumble()
-          }
+        // Outside the Feel column: force feedback goes through the gamepad's
+        // input node, which works without hidraw access.
+        Button {
+          visible: root.connected && root.tab === "feel"
+          enabled: root.canRumble
+          opacity: enabled ? 1 : 0.5
+          iconText: "󰕦"
+          text: "Test rumble"
+          tooltipText: "Half a second on both motors, through the same force-feedback path games use"
+          fontSize: Style.font.bodySmall
+          foreground: root.fg
+          fontFamily: root.face
+          bordered: true
+          onClicked: root.testRumble()
         }
 
         // ================= AUDIO =================

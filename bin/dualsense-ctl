@@ -1014,15 +1014,18 @@ def cmd_trigger(args):
 
 def cmd_rumble(args):
     for info in select_controllers(args, need_hidraw=False):
+        # The gamepad's evdev node is open to the seat user without any extra
+        # udev rule, so force feedback must not wait on the hidraw node; only
+        # the raw fallback opens that.
+        if not args.raw and info["access"]["event"]:
+            try:
+                Controller(info).rumble_evdev(args.strong, args.weak, args.ms)
+                continue
+            except OSError:
+                pass
+        if not info["access"]["hidraw"]:
+            die("No access to %s or %s" % (info["node"], info.get("event")), 4)
         with Controller(info) as ctl:
-            if not args.raw and info["access"]["event"]:
-                try:
-                    ctl.rumble_evdev(args.strong, args.weak, args.ms)
-                    continue
-                except OSError:
-                    pass
-            if not info["access"]["hidraw"]:
-                die("No access to %s or %s" % (info["node"], info.get("event")), 4)
             fw = ctl.firmware() or {}
             common = ctl.new_common()
             ctl.fill_rumble(common, args.strong, args.weak, fw.get("vibrationV2", True))

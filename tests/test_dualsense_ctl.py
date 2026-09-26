@@ -249,6 +249,30 @@ class ProfileFileTest(unittest.TestCase):
         self.assertFalse(os.path.exists(self.path + ".tmp"))
 
 
+class RumbleTest(unittest.TestCase):
+    def controller(self, hidraw, event):
+        return {"id": "aa:bb", "mac": "aa:bb", "model": "DualSense", "bus": "usb",
+                "node": "/nonexistent/hidraw-test", "event": "/nonexistent/event-test",
+                "access": {"hidraw": hidraw, "event": event}}
+
+    def test_force_feedback_needs_no_hidraw_access(self):
+        # The gamepad's evdev node is open to the seat user without the udev
+        # rule; the hidraw node is not. Rumble must not touch hidraw first.
+        played = []
+        with mock.patch.object(ctl, "find_controllers", return_value=[self.controller(False, True)]), \
+                mock.patch.object(ctl.Controller, "rumble_evdev", lambda c, s, w, ms: played.append((s, w, ms))):
+            ctl.main(["rumble", "--strong", "90", "--weak", "50", "--ms", "10"])
+        self.assertEqual(played, [(90, 50, 10)])
+
+    def test_no_access_at_all(self):
+        with mock.patch.object(ctl, "find_controllers", return_value=[self.controller(False, False)]), \
+                contextlib.redirect_stderr(io.StringIO()) as err, \
+                self.assertRaises(SystemExit) as exit:
+            ctl.main(["rumble"])
+        self.assertEqual(exit.exception.code, 4)
+        self.assertIn("No access", err.getvalue())
+
+
 class StatusTest(unittest.TestCase):
     """The panel parses this payload; its keys are part of the plugin's contract."""
 
