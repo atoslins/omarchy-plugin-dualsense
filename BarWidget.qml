@@ -20,14 +20,36 @@ Panel {
   manageIpc: false
 
   // ---------- settings (this widget's entry in shell.json) ----------
-  readonly property int pollSeconds: setting("pollSeconds", 5)
-  readonly property bool notificationsEnabled: setting("notifications", true) !== false
-  readonly property int lowBattery: setting("lowBattery", 20)
-  readonly property bool applyOnConnect: setting("applyOnConnect", true) !== false
-  readonly property string profileSetting: String(setting("profileFile", "~/.config/dualsense/profile.json"))
+  // `omarchy bar set <id> <key> <value>` stores the value as text unless
+  // --json is passed, so "false" and "15" must read as false and 15; values
+  // out of range are clamped rather than trusted.
+  function flagSetting(name, fallback) {
+    var v = setting(name, fallback)
+    if (typeof v === "string") v = v.trim().toLowerCase()
+    if (v === true || v === 1 || v === "true" || v === "on" || v === "yes" || v === "1") return true
+    if (v === false || v === 0 || v === "false" || v === "off" || v === "no" || v === "0") return false
+    return fallback
+  }
+
+  function wholeSetting(name, fallback, lo, hi) {
+    var v = setting(name, fallback)
+    var n = typeof v === "string" && v.trim() === "" ? NaN : Number(v)
+    return isFinite(n) ? Math.max(lo, Math.min(hi, Math.round(n))) : fallback
+  }
+
+  function textSetting(name, fallback) {
+    var v = String(setting(name, fallback)).trim()
+    return v !== "" ? v : fallback
+  }
+
+  readonly property int pollSeconds: wholeSetting("pollSeconds", 5, 1, 3600)
+  readonly property bool notificationsEnabled: flagSetting("notifications", true)
+  readonly property int lowBattery: wholeSetting("lowBattery", 20, 0, 100)
+  readonly property bool applyOnConnect: flagSetting("applyOnConnect", true)
+  readonly property string profileSetting: textSetting("profileFile", "~/.config/dualsense/profile.json")
   readonly property string profileFile: profileSetting.indexOf("~") === 0 ? Quickshell.env("HOME") + profileSetting.substring(1) : profileSetting
-  readonly property bool showPercent: setting("showPercent", true) !== false
-  readonly property bool hideWhenDisconnected: setting("hideWhenDisconnected", false) === true
+  readonly property bool showPercent: flagSetting("showPercent", true)
+  readonly property bool hideWhenDisconnected: flagSetting("hideWhenDisconnected", false)
 
   // ---------- live state ----------
   property var controllers: []

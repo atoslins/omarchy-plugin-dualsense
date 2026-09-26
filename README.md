@@ -165,12 +165,21 @@ it exits; the plugin re-applies your profile on the next connection or with
 
 ## Settings
 
-In the widget's entry in `~/.config/omarchy/shell.json`:
+Set them with `omarchy bar set`:
 
-- `pollSeconds` (default `5`) — polling interval while a controller is
+```bash
+omarchy bar set atoslins.dualsense lowBattery 15
+omarchy bar set atoslins.dualsense hideWhenDisconnected true
+```
+
+or in the widget's entry in `~/.config/omarchy/shell.json`. Switches take
+`true`/`false` (also `on`/`off`, `yes`/`no`, `1`/`0`); numbers out of range
+are clamped.
+
+- `pollSeconds` (default `5`, 1–3600) — polling interval while a controller is
   connected and the panel is closed.
 - `notifications` (default `true`) — desktop notifications.
-- `lowBattery` (default `20`) — percentage that counts as low.
+- `lowBattery` (default `20`, 0–100) — percentage that counts as low.
 - `applyOnConnect` (default `true`) — re-apply the profile when a controller
   connects (and at shell start).
 - `profileFile` (default `~/.config/dualsense/profile.json`) — where the
