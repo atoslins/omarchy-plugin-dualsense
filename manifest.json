@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "atoslins.dualsense",
   "name": "DualSense",
-  "version": "1.0.3",
+  "version": "1.1.0",
   "author": "Atos Lins",
   "license": "MIT",
   "description": "PlayStation DualSense battery, lightbar, player LEDs, adaptive triggers, audio, rumble and a live input tester in the bar",

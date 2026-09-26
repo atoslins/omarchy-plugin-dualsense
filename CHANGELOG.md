@@ -7,6 +7,8 @@ change is spelled out in [CONTRIBUTING.md](CONTRIBUTING.md#versions).
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-09-26
+
 After updating, restart the shell (`omarchy restart shell`): it keeps the
 panel code it already loaded until it restarts.
 
