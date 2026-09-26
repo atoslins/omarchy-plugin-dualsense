@@ -4,6 +4,7 @@
   "name": "DualSense",
   "version": "1.0.3",
   "author": "Atos Lins",
+  "license": "MIT",
   "description": "PlayStation DualSense battery, lightbar, player LEDs, adaptive triggers, audio, rumble and a live input tester in the bar",
   "kinds": [
     "bar-widget"
@@ -15,6 +16,7 @@
     "displayName": "DualSense",
     "description": "DualSense controller battery and full control panel",
     "category": "Info",
-    "allowMultiple": false
+    "allowMultiple": false,
+    "defaultSection": "right"
   }
 }

@@ -67,7 +67,8 @@ omarchy plugin add https://github.com/atoslins/omarchy-plugin-dualsense
 omarchy plugin enable atoslins.dualsense
 ```
 
-Move it where you like: `omarchy bar move atoslins.dualsense --section right --index 3`.
+It lands in the right section of the bar; move it where you like:
+`omarchy bar move atoslins.dualsense --section right --index 3`.
 
 ## Remove
 
