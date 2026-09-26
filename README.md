@@ -35,7 +35,9 @@ driver, with no extra packages.
 - Desktop notifications (via the Omarchy shell) for: controller connected /
   disconnected, battery low, fully charged.
 - Power off / disconnect buttons when the controller is on Bluetooth.
-- Several controllers: a picker appears and each one is handled separately.
+- Several controllers: a picker chooses which one the panel shows (battery,
+  tester, details). Lightbar, LED, trigger and audio settings are one profile
+  applied to every controller.
 - Hot-plug aware (udev): a controller shows up the moment it connects. While
   one is connected the widget polls every 5 s (2 s with the panel open); with
   none it checks once a minute.
@@ -71,6 +73,26 @@ omarchy plugin enable atoslins.dualsense
 
 It lands in the right section of the bar; move it where you like:
 `omarchy bar move atoslins.dualsense --section right --index 3`.
+
+## Update
+
+```bash
+omarchy plugin update atoslins.dualsense
+omarchy restart shell
+```
+
+The update shows the diff before applying it, and
+[CHANGELOG.md](CHANGELOG.md) — also on the
+[releases page](https://github.com/atoslins/omarchy-plugin-dualsense/releases) —
+says what changed. Restart the shell afterwards: it keeps the panel code it
+already loaded until then.
+
+Every version is tagged. To go back to one, check out its tag and restart the
+shell; the next `omarchy plugin update` brings you to the latest again:
+
+```bash
+git -C ~/.config/omarchy/plugins/atoslins.dualsense checkout v1.0.3
+```
 
 ## Remove
 
