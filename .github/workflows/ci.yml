@@ -23,3 +23,7 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: Unit tests
         run: python -m unittest discover -s tests -v
+      - name: Release scripts
+        run: |
+          command -v shellcheck >/dev/null || sudo apt-get install -y shellcheck
+          shellcheck scripts/release scripts/release-notes
